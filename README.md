@@ -1,5 +1,3 @@
----
-
 # CO2-Ejector-BaroTFM: Two-Fluid Barotropic Pipeline
 
 A specialized Python-to-Ansys CFX pipeline designed for the simulation of two-phase supersonic CO2 ejectors. This framework implements a **Barotropic Two-Fluid Model (TFM)**, treating the motive and suction streams as distinct continuous phases that expand isentropically and mix according to the conservation of total enthalpy.
@@ -49,5 +47,3 @@ $$\frac{1}{\rho c_{\text{eq}}^2} = \underbrace{\frac{\alpha_l}{\rho_l c_l^2} + \
 * CoolProp (`HEOS` backend)
 * Pandas & NumPy
 * Ansys CFX (v19.1 or higher recommended)
-
----
