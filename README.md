@@ -1,4 +1,3 @@
----
 
 # CO2-Ejector-BaroTFM: High-Fidelity Two-Fluid Pipeline
 
@@ -43,5 +42,3 @@ The pipeline generates nested `if` expressions to manage the suction inlet press
 1.  Configure your operating point in `BaroTFM.py`.
 2.  Run the script to generate the alphanumeric `Physics.ccl` and axial-profile `PostProcess.cse`.
 3.  Import the CCL into CFX-Pre and ensure the domain name matches your `DOMAIN_NAME` config.
-
----
