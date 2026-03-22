@@ -1,49 +1,47 @@
-# CO2-Ejector-BaroTFM: Two-Fluid Barotropic Pipeline
+---
 
-A specialized Python-to-Ansys CFX pipeline designed for the simulation of two-phase supersonic CO2 ejectors. This framework implements a **Barotropic Two-Fluid Model (TFM)**, treating the motive and suction streams as distinct continuous phases that expand isentropically and mix according to the conservation of total enthalpy.
+# CO2-Ejector-BaroTFM: High-Fidelity Two-Fluid Pipeline
 
-## 🚀 Key Features
+A specialized Python-to-Ansys CFX pipeline designed for simulating **Two-Phase Supersonic CO2 Ejectors**. This framework implements a physically rigorous **Barotropic Two-Fluid Model (TFM)** that treats motive and suction streams as distinct continuous phases, using mass-weighted enthalpy conservation to resolve the mixing zone.
 
-* **Automated CFX Setup**: Generates complete CFX Command Language (CCL) files including material definitions, 1D interpolation functions, and multiphase domain configurations.
-* **HEM Speed of Sound**: Implements the Fully-Relaxed Homogeneous Equilibrium Model (HEM) for speed of sound, accounting for mechanical compressibility and thermal relaxation terms ($ds/dp$).
-* **Enthalpy-Based Mixture Reconstruction**: Utilizes solver-level Algebraic Additional Variables to reconstruct mixture quality ($x_{mix}$) and vapor volume fractions based on mass-weighted enthalpy conservation.
-* **CEL Compliance**: Enforces strict alphanumeric naming conventions for all solver variables to ensure compatibility with the Ansys CFX Expression Language.
-* **High-Resolution Thermodynamics**: Uses a stretched pressure grid to resolve sharp property gradients near the CO2 critical point ($73.8$ bar).
+## 🚀 Key Technical Features
 
-## 🛠 Project Structure
+* **Solver-Level Enthalpy Reconstruction**: Implements a 5-step Algebraic Additional Variable (AV) chain (`RhoMix` $\rightarrow$ `Ymot` $\rightarrow$ `Hmix` $\rightarrow$ `Xmix` $\rightarrow$ `VfVapMix`) to reconstruct the mixture thermodynamic state from conserved stagnation enthalpies.
+* **Iteration-Based Pressure Ramping**: Utilizes a dynamic, parameterized CEL function linked to the CFX variable `aitern` (accumulated iteration number). This gradually transitions the suction inlet from discharge pressure to the target vacuum, ensuring numerical stability.
+* **HEM Speed of Sound**: Features a fully-relaxed Homogeneous Equilibrium Model (HEM) formulation, including thermal relaxation terms derived from saturation entropy derivatives ($ds/dp$).
+* **Extended Suction Table Range**: Property tables for the suction fluid are automatically extended to the motive inlet pressure ($P_{mot,in}$). This ensures property validity during compression waves and expansion fans within the mixing section.
+* **Validated CEL Compliance**: Enforces a strict alphanumeric naming convention (no underscores) for all Material, Function, and AV names to bypass legacy CFX parser restrictions.
 
-* **`two_fluid_utils.py`**: The core thermodynamic engine. It utilizes CoolProp (HEOS) to generate equilibrium isentropes and saturation property tables ($h_l, h_v, \rho_l, \rho_v$).
-* **`two_fluid_pipeline.py`**: The bridge between Python and CFX. It handles the generation of 1D data pairs for interpolation and writes the `.ccl` and `.cse` scripts.
-* **`BaroTFM.py`**: Documentation generator and master logic for the Barotropic Two-Fluid Model theory.
+## 📖 Mathematical Background
 
-## 📖 Theoretical Framework
+### 1. Mixture Energetics
+While individual fluids expand along isentropic paths, the mixing process is governed by the conservation of total enthalpy. The mixture static enthalpy $h_{mix}$ is computed by subtracting kinetic energy from the mass-weighted stagnation enthalpies:
 
-### 1. The Barotropic Assumption
-Properties for each fluid ($\rho, \mu$) are pre-calculated as functions of pressure along path-specific isentropes ($s_{mot}$ and $s_{suc}$).
+$$h_{mix} = (Y_{mot} h_{0,mot} + Y_{suc} h_{0,suc}) - \frac{1}{2} |\mathbf{U}|^2$$
 
-### 2. Enthalpy-Based Mixing (Solver-Level)
-The local state of the mixture is determined by the conservation of total enthalpy ($h_0$):
-* **Mass Fraction ($Y_{mot}$)**: Derived from the solver's volume fractions and path densities.
-* **Static Enthalpy ($h_{mix}$)**: $h_{mix} = (Y_{mot}h_{0,mot} + Y_{suc}h_{0,suc}) - 0.5|\mathbf{U}|^2$.
-* **Reconstructed Quality ($x_{mix}$)**: Determined by comparing $h_{mix}$ to the saturation enthalpies $h_l(P)$ and $h_v(P)$.
+### 2. Fully-Relaxed Acoustics (HEM)
+The equilibrium speed of sound $c_{eq}$ captures the drastic change in compressibility within the two-phase region:
 
-### 3. HEM Speed of Sound
-The speed of sound ($c_{eq}$) in the two-phase region is calculated to include thermal relaxation:
-$$\frac{1}{\rho c_{\text{eq}}^2} = \underbrace{\frac{\alpha_l}{\rho_l c_l^2} + \frac{\alpha_v}{\rho_v c_v^2}}_{\text{Mechanical}} + \underbrace{T \left[ \frac{\alpha_l \rho_l}{C_{p,\ell}} \left( \frac{d s_l}{d p} \right)^2 + \frac{\alpha_v \rho_v}{C_{p, v}} \left( \frac{d s_v}{d p} \right)^2 \right]}_{\text{Thermal Relaxation}}$$
+$$\frac{1}{\rho c_{eq}^2} = \frac{\alpha_l}{\rho_l c_l^2} + \frac{\alpha_v}{\rho_v c_v^2} + T \left[ \frac{\alpha_l \rho_l}{C_{p,l}} \left( \frac{ds_l}{dp} \right)^2 + \frac{\alpha_v \rho_v}{C_{p,v}} \left( \frac{ds_v}{dp} \right)^2 \right]$$
 
+## 🛠 Repository Structure
 
-## 💻 Usage
+* **`two_fluid_utils.py`**: The thermodynamic engine using CoolProp (HEOS) to generate stretched pressure grids (dense band $\pm 5$ bar around $P_{crit}$) and HEM building blocks.
+* **`two_fluid_pipeline.py`**: The core logic handler that translates Python DataFrames into validated CFX CCL and CSE scripts.
+* **`BaroTFM.py`**: The master driver script for single-point runs or parametric sweeps, including boundary location mapping.
+* **`BaroTFM.tex`**: Comprehensive technical manual documenting the theory and implementation.
 
-1.  **Configure Inlet States**: Set the motive and suction stagnation pressures and temperatures in your master configuration script.
-2.  **Generate Tables & CCL**: Run the pipeline to generate the `df_mot` and `df_suc` tables and the corresponding `Physics.ccl` file.
-3.  **Solver Execution**:
-    * Import the generated CCL into your Ansys CFX-Pre setup.
-    * Ensure the domain is set to `Multiphase` with `Homogeneous` velocity coupling.
-4.  **Post-Processing**: Run the generated `.cse` script in CFX-Post to extract axial profiles and reconstructed mixture properties.
+## 💻 Solver Control & Usage
 
-## ⚠️ Requirements
+### Pressure Ramping Strategy
+The pipeline generates nested `if` expressions to manage the suction inlet pressure (`PsucinRamp`) based on the current iteration count (`aitern`):
+* **Stage 1**: `aitern` $\le 1500$ (Startup stabilization).
+* **Stage 2**: $1500 < $ `aitern` $\le 3000$ (Intermediate compression).
+* **Stage 3**: `aitern` $> 3000$ (Target vacuum).
 
-* Python 3.x
-* CoolProp (`HEOS` backend)
-* Pandas & NumPy
-* Ansys CFX (v19.1 or higher recommended)
+### Quick Start
+1.  Configure your operating point in `BaroTFM.py`.
+2.  Run the script to generate the alphanumeric `Physics.ccl` and axial-profile `PostProcess.cse`.
+3.  Import the CCL into CFX-Pre and ensure the domain name matches your `DOMAIN_NAME` config.
+
+---
