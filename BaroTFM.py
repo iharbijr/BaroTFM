@@ -74,6 +74,26 @@ sim_config = {
     # -- Isothermal fluid temperature (from working .def) -----------------------
     "FLUID_TEMPERATURE": 330.0,         # [K]
 
+    # -- Solver / output control ------------------------------------------------
+    # RAMPING_STEPS: list of (iteration_threshold, fraction) tuples.
+    #   fraction is the proportion of the range Pout -> Psucin applied at each stage.
+    #   Steps with fraction=1.0 are stripped — full Psucin is the implicit fallback.
+    #   Empty list (or key absent) = no ramp, immediate full Psucin from iteration 1.
+    #
+    # Generated CEL:
+    #   Pstart     = Pout   (discharge pressure — ramp anchor)
+    #   PsucinRamp = if(aitern <= 1500, Pstart + 0.33*(Psucin-Pstart),
+    #                   if(aitern <= 3000, Pstart + 0.66*(Psucin-Pstart), Psucin))
+    "SOLVER_SETTINGS": {
+        "MAX_ITER":        10000,
+        "BACKUP_INTERVAL": 500,
+        "RAMPING_STEPS": [
+            (1500,  0.33),   # 33% of range at iteration 1500
+            (3000,  0.66),   # 66% of range at iteration 3000
+            (10000, 1.00),   # full target — stripped, becomes else-branch
+        ],
+    },
+
     # -- Cluster / solver -------------------------------------------------------
     "CFX_BIN":   "/software/ansys/v242/CFX/bin",
     "NODES":     "node-4-16*40",

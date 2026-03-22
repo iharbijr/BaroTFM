@@ -11,20 +11,45 @@ KEY STRUCTURAL FACTS (parsed from working .def)
 ------------------------------------------------
 Option = Material Library          NOT "Material", NOT "Mixture Component"
 MORPHOLOGY: sub-block              NOT inline "Morphology Option ="
-FLUID: <name> under BOUNDARY:     NOT under BOUNDARY CONDITIONS:
-VOLUME FRACTION inside FLUID BC   same pattern as working .def
-REFERENCE PRESSURE: in DOMAIN MODELS (bar, not Pa)
+FLUID: <n> under BOUNDARY:        NOT under BOUNDARY CONDITIONS:
+VOLUME FRACTION inside FLUID BC    same pattern as working .def
+REFERENCE PRESSURE: in DOMAIN MODELS (0 [bar])
 MULTIPHASE MODELS: Homogeneous Model = On  (flag, not Option = Homogeneous)
 FLUID PAIR: is a top-level domain block, NOT inside FLUID MODELS
-Outlet  → OPENING + Opening Pressure and Direction
-Suc. inlet → Static Pressure  (motive → Total Pressure)
-&replace DOMAIN: <name>           replaces entire domain block in .def
+Outlet  -> OPENING + Opening Pressure and Direction
+Suc. inlet -> Static Pressure  (motive -> Total Pressure)
+&replace DOMAIN: <n>           replaces entire domain block in .def
 
 CEL NAMING (CFX legacy parser — underscores are internal delimiters)
 ---------------------------------------------------------------------
 All FUNCTION, ADDITIONAL VARIABLE, MATERIAL, FLUID DEFINITION, and
 EXPRESSION names are strictly alphanumeric.  BOUNDARY / DOMAIN names
 and Python config keys are exempt — they are never CEL identifiers.
+
+ENTHALPY AV CHAIN (solver-level mixture reconstruction)
+-------------------------------------------------------
+Algebraic AVs evaluated inside FLUID: MotiveCO2 block (CFX requires
+a fluid host even for mixture-level quantities):
+
+  RhoMix   = VF_mot * MotiveRho(P)  + VF_suc * SuctionRho(P)
+  Ymot     = (VF_mot * MotiveRho(P)) / RhoMix
+  Hmix     = Ymot*H0mot + (1-Ymot)*H0suc - 0.5*(u^2+v^2+w^2)
+  Xmix     = max(0, min(1, (Hmix - fnHlsat(P))/(fnHvsat(P)-fnHlsat(P))))
+  VfVapMix = (Xmix * RhoMix) / fnRhov(P)
+
+Xmix is clipped to [0, 1] to maintain stability in subcooled / superheated
+single-phase regions where the enthalpy falls outside the saturation dome.
+
+Velocity kinetic energy uses component form valid in solver CEL:
+  0.5 * (Velocity u^2 + Velocity v^2 + Velocity w^2)
+
+EXTENDED SUCTION RANGE
+-----------------------
+The SuctionRho and SuctionMu tables are built on a grid from P_triple
+to P_mot_in (not P_suc_in).  This ensures the barotropic functions
+remain valid during compression of the suction fluid in the mixing
+section where static pressure may exceed the suction inlet pressure.
+The isentrope itself is still anchored at (P_suc_in, T_suc_in).
 
 Author: auto-generated for Ahmed's cfx_writer / NEB pipeline
 """
@@ -37,6 +62,7 @@ import matplotlib.pyplot as plt
 import pandas as pd
 from two_fluid_utils import (
     generate_equilibrium_table,
+    generate_saturation_table,
     print_table_summary,
     plot_sos_comparison,
 )
@@ -52,6 +78,67 @@ _DEFAULT_WALL_LOCATION = (
     "F374.148,F375.148,F376.148,F390.148,F391.148,F392.148,"
     "F393.148,F409.18,F410.18,F46.54,F55.43,F83.148"
 )
+
+
+# ================================================================================
+# 0.  CEL RAMP BUILDER
+# ================================================================================
+
+def build_ramp_cel(
+    steps:        list[tuple[int, float]],
+    start_expr:   str = "Pstart",
+    target_expr:  str = "Psucin",
+) -> str:
+    """
+    Build a nested CEL if-expression that ramps a pressure from start to target
+    using CFX's built-in iteration counter variable ``aitern``.
+
+    Parameters
+    ----------
+    steps       : list of (iter_threshold, fraction) tuples.
+                  fraction is the proportion of the full range to apply at that
+                  stage.  Entries with fraction == 1.0 are stripped — the full
+                  target is the implicit else-branch of the last real step.
+                  Steps are sorted ascending by threshold before processing.
+    start_expr  : CEL expression for the ramp start (default "Pstart").
+    target_expr : CEL expression for the final target (default "Psucin").
+
+    Returns
+    -------
+    cel : str   A valid CEL expression string, e.g.:
+                  if(aitern <= 1500, Pstart + 0.3300 * (Psucin - Pstart),
+                     if(aitern <= 3000, Pstart + 0.6600 * (Psucin - Pstart),
+                        Psucin))
+
+    Special cases
+    -------------
+    Empty or None steps  ->  returns target_expr directly (no ramp, immediate full BC).
+    Single step (f=1.0)  ->  returns target_expr (same as empty).
+    """
+    if not steps:
+        return target_expr
+
+    # Sort and strip trailing full-target steps
+    sorted_steps = sorted(steps, key=lambda x: x[0])
+    while sorted_steps and sorted_steps[-1][1] >= 1.0:
+        sorted_steps.pop()
+
+    if not sorted_steps:
+        return target_expr   # all steps were full-target
+
+    def _ramp_val(frac: float) -> str:
+        return f"{start_expr} + {frac:.4f} * ({target_expr} - {start_expr})"
+
+    def _build(remaining: list[tuple[int, float]]) -> str:
+        if not remaining:
+            return target_expr
+        itern, frac = remaining[0]
+        return (
+            f"if(aitern <= {itern}, {_ramp_val(frac)}, "
+            f"{_build(remaining[1:])})"
+        )
+
+    return _build(sorted_steps)
 
 
 # ================================================================================
@@ -88,19 +175,34 @@ def _clean_series(df: pd.DataFrame, col: str) -> pd.Series:
 # 2.  CATALOGUES
 # ================================================================================
 
-# Material-property interpolation functions  →  MotiveRho, MotiveMu, etc.
+# Material-property functions  ->  MotiveRho, MotiveMu, SuctionRho, SuctionMu
 _MAT_FUNC_CATALOGUE: dict[str, tuple[str, str]] = {
     "Rho": ("Rho", "kg m^-3"),
     "Mu":  ("Mu",  "kg m^-1 s^-1"),
 }
 
-# AV interpolation functions  →  fnMotiveAlphaV, fnSuctionSoS, etc.
-# Keys are alphanumeric (compose CEL names); df column names may use underscores.
+# Per-phase isentrope AV functions  ->  fnMotiveAlphaV, fnSuctionSoS, etc.
 _AV_FUNC_CATALOGUE: dict[str, tuple[str, str]] = {
     "AlphaV": ("AlphaV",  "[]"),
     "SoS":    ("SoS",     "m s^-1"),
     "Xv":     ("X_v",     "[]"),
     "Xlsat":  ("X_l_sat", "[]"),
+}
+
+# Saturation-dome functions (path-independent, from dedicated df_sat)
+_SAT_FUNC_CATALOGUE: dict[str, tuple[str, str]] = {
+    "fnHlsat": ("Hlsat", "J kg^-1"),
+    "fnHvsat": ("Hvsat", "J kg^-1"),
+    "fnRhov":  ("Rhov",  "kg m^-3"),
+}
+
+# Enthalpy mixture AVs (declared Fluid Dependent; equations in FLUID: MotiveCO2)
+_ENTHALPY_AV_CATALOGUE: dict[str, str] = {
+    "RhoMix":   "kg m^-3",
+    "Ymot":     "[]",
+    "Hmix":     "J kg^-1",
+    "Xmix":     "[]",
+    "VfVapMix": "[]",
 }
 
 
@@ -112,75 +214,44 @@ def write_two_fluid_ccl(
     filename: str,
     df_mot:   pd.DataFrame,
     df_suc:   pd.DataFrame,
+    df_sat:   pd.DataFrame,
     config:   dict,
+    h0_mot:   float = 0.0,
+    h0_suc:   float = 0.0,
 ) -> None:
     """
     Write a complete &replace CCL patch for the Two-Fluid Barotropic ejector.
 
-    The file contains two top-level blocks:
+    Solver control parameters are read from config["SOLVER_SETTINGS"] (optional):
+      MAX_ITER       : int   Maximum solver iterations          (default 2000)
+      BACKUP_INTERVAL: int   Backup results every N iterations  (default 500)
+      RAMPING_STEPS  : list  [(iter, fraction), ...]  suction pressure ramp
+                             fraction = proportion of range Pout -> Psucin
+                             default: [] = immediate full target (no ramp)
 
-    LIBRARY
-      ├── ADDITIONAL VARIABLE definitions  (MotiveAlphaV, SuctionSoS, ...)
-      ├── MATERIAL: MotiveCO2              (ρ, μ = CEL function calls)
-      ├── MATERIAL: SuctionCO2
-      └── CEL
-            ├── EXPRESSIONS  (Pmotin, Psucin, Pout — alphanumeric only)
-            ├── FUNCTION: MotiveRho, MotiveMu, ...       (material tables)
-            └── FUNCTION: fnMotiveAlphaV, fnSuctionSoS,... (AV tables)
+    Pressure ramp logic:
+      Pstart     = Pout   (discharge pressure — ramp anchor)
+      PsucinRamp = build_ramp_cel(steps)
+                 = Psucin  when no steps (full target immediately)
+                 = if(aitern <= N1, Pstart + f1*(Psucin-Pstart), ...)  with ramp
 
-    FLOW: Flow Analysis 1
-      └── &replace DOMAIN: <DOMAIN_NAME>
-            Domain Type = Fluid
-            Location = <DOMAIN_LOCATION>
-            BOUNDARY: <WALL_BC_NAME>        (wall — preserved from .def)
-            BOUNDARY: <MOT_BC_NAME>         (motive inlet, Total Pressure)
-            BOUNDARY: <SUC_BC_NAME>         (suction inlet, Static Pressure)
-            BOUNDARY: <OUT_BC_NAME>         (opening outlet)
-            BOUNDARY: <SYMM1_NAME>          (symmetry 1, if present)
-            BOUNDARY: <SYMM2_NAME>          (symmetry 2, if present)
-            DOMAIN MODELS
-              └── REFERENCE PRESSURE: 0 [bar]
-            FLUID DEFINITION: MotiveCO2
-              Option = Material Library     ← verified token
-              MORPHOLOGY: Continuous Fluid
-            FLUID DEFINITION: SuctionCO2   (same)
-            FLUID MODELS
-              └── SST turbulence, isothermal heat transfer
-            FLUID PAIR: MotiveCO2 | SuctionCO2
-              └── no interphase transfer
-            MULTIPHASE MODELS
-              └── Homogeneous Model = On    ← flag form, verified
-
-    Volume fraction BC syntax (verified from working .def):
-      FLUID: MotiveCO2                      ← directly under BOUNDARY:
-        BOUNDARY CONDITIONS:
-          VOLUME FRACTION:
-            Option = Value
-            Volume Fraction = 1.0
-          END
-        END
-      END
-
-    Required config keys
     --------------------
-    P_mot_in, T_mot_in         Motive  inlet stagnation [Pa], [K]
-    P_suc_in, T_suc_in         Suction inlet static     [Pa], [K]
-    P_out                      Outlet opening pressure  [Pa]
-    DOMAIN_NAME                e.g. "Ejector"
-    DOMAIN_LOCATION            mesh region string from .def
-    MOT_BC_NAME / _LOCATION    motive inlet boundary name + mesh face tag
-    SUC_BC_NAME / _LOCATION    suction inlet boundary name + mesh face tag
-    OUT_BC_NAME / _LOCATION    outlet boundary name + mesh face tag
-    WALL_BC_NAME / _LOCATION   wall boundary name + face list string
-    SYMM1_NAME / _LOCATION     symmetry plane 1 (optional)
-    SYMM2_NAME / _LOCATION     symmetry plane 2 (optional)
-    FLUID_TEMPERATURE          isothermal temperature [K]  (default 330)
+    P_mot_in, T_mot_in       Motive  inlet stagnation [Pa], [K]
+    P_suc_in, T_suc_in       Suction inlet static     [Pa], [K]
+    P_out                    Outlet opening pressure   [Pa]
+    DOMAIN_NAME              e.g. "Ejector"
+    DOMAIN_LOCATION          mesh region string from .def
+    MOT_BC_NAME/_LOCATION    motive  inlet boundary name + mesh face tag
+    SUC_BC_NAME/_LOCATION    suction inlet boundary name + mesh face tag
+    OUT_BC_NAME/_LOCATION    outlet boundary name + mesh face tag
+    WALL_BC_NAME/_LOCATION   wall boundary name + face list
+    SYMM1_NAME/_LOCATION     symmetry plane 1 (optional)
+    SYMM2_NAME/_LOCATION     symmetry plane 2 (optional)
+    FLUID_TEMPERATURE        isothermal fluid temperature [K]  (default 330)
     """
-    # ── Unpack config ──────────────────────────────────────────────────────────
     domain      = config.get("DOMAIN_NAME",      "Ejector")
     dom_loc     = config.get("DOMAIN_LOCATION",
                              "DIFF,EXIT,MC,MC_DIFF,MC_DIV,MN,MN_in,SN")
-
     bc_mot      = config.get("MOT_BC_NAME",      "Inlet MN")
     bc_mot_loc  = config.get("MOT_BC_LOCATION",  "Inlet_MN")
     bc_suc      = config.get("SUC_BC_NAME",      "Inlet SN")
@@ -199,6 +270,16 @@ def write_two_fluid_ccl(
     T_mot = config["T_mot_in"]
     P_suc = config["P_suc_in"]
     P_out = config["P_out"]
+
+    # ── Solver / output settings (from optional SOLVER_SETTINGS sub-dict) ──────
+    _ss              = config.get("SOLVER_SETTINGS", {})
+    max_iter         = int(_ss.get("MAX_ITER",        2000))
+    backup_interval  = int(_ss.get("BACKUP_INTERVAL", 500))
+    ramping_steps    = _ss.get("RAMPING_STEPS",       [])
+
+    # Build the suction ramp CEL expression
+    ramp_cel         = build_ramp_cel(ramping_steps)
+    has_ramp         = (ramp_cel != "Psucin")
 
     _phases = [("Motive", df_mot), ("Suction", df_suc)]
 
@@ -226,7 +307,6 @@ def write_two_fluid_ccl(
         f.write( "  END\n")
 
     def _write_vf_fluid(f, fluid_name, vf_value, indent="    "):
-        """Write a FLUID: volume-fraction block directly under BOUNDARY: (verified syntax)."""
         pad = indent
         if vf_value == "Zero Gradient":
             f.write(f"{pad}FLUID: {fluid_name}\n")
@@ -246,12 +326,9 @@ def write_two_fluid_ccl(
             f.write(f"{pad}  END\n")
             f.write(f"{pad}END\n")
 
-    # ── open UTF-8 ─────────────────────────────────────────────────────────────
     with open(filename, "w", encoding="utf-8") as f:
 
-        # ======================================================================
-        # FILE HEADER
-        # ======================================================================
+        # ── File header ────────────────────────────────────────────────────────
         f.write("# ============================================================\n")
         f.write("# Two-Fluid Barotropic CCL  --  auto-generated\n")
         f.write(f"# Motive : {P_mot/1e5:.3f} bar / {T_mot-273.15:.2f} C\n")
@@ -259,7 +336,8 @@ def write_two_fluid_ccl(
         f.write(f"# Outlet : {P_out/1e5:.3f} bar (opening)\n")
         f.write(f"# Domain : {domain}\n")
         f.write("# Model  : Eulerian Homogeneous Multiphase, HEM SoS\n")
-        f.write("# Schema : verified against CFX-Pre 24.x working .def\n")
+        f.write("# Enthalpy AV chain: RhoMix->Ymot->Hmix->Xmix[0,1]->VfVapMix\n")
+        f.write("# Suction grid extended to P_mot_in for mixing-section validity\n")
         f.write("# ============================================================\n\n")
 
         # ======================================================================
@@ -267,13 +345,18 @@ def write_two_fluid_ccl(
         # ======================================================================
         f.write("LIBRARY:\n\n")
 
-        # -- AV definitions (alphanumeric names) --------------------------------
-        f.write("  # -- Per-phase Algebraic Additional Variables ---------------\n")
+        # -- AV definitions (per-phase isentrope AVs) -------------------------
+        f.write("  # -- Per-phase isentrope AVs --------------------------------\n")
         for phase, _ in _phases:
             for key, (_, units) in _AV_FUNC_CATALOGUE.items():
-                _write_av_def(f, f"{phase}{key}", units)  # e.g. MotiveAlphaV
+                _write_av_def(f, f"{phase}{key}", units)
 
-        # -- MATERIAL blocks (&replace overwrites existing library entry) ---------
+        # -- AV definitions (enthalpy chain mixture AVs) ----------------------
+        f.write("  # -- Enthalpy mixture reconstruction AVs -------------------\n")
+        for av_name, units in _ENTHALPY_AV_CATALOGUE.items():
+            _write_av_def(f, av_name, units)
+
+        # -- MATERIAL blocks (with &replace) ----------------------------------
         for phase, _ in _phases:
             mat = f"{phase}CO2"
             f.write(f"\n  # -- Material: {mat} ------------------------------------\n")
@@ -284,8 +367,6 @@ def write_two_fluid_ccl(
             f.write( "    Option = Pure Substance\n")
             f.write( "    PROPERTIES:\n")
             f.write( "      Option = General Material\n")
-            # Order: DYNAMIC VISCOSITY → EQUATION OF STATE → SPECIFIC HEAT
-            # (matches verified working CCL field order)
             f.write( "      DYNAMIC VISCOSITY:\n")
             f.write(f"        Dynamic Viscosity = {phase}Mu(Absolute Pressure)\n")
             f.write( "        Option = Value\n")
@@ -303,36 +384,49 @@ def write_two_fluid_ccl(
             f.write( "    END\n")
             f.write( "  END\n")
 
-        # -- CEL block ---------------------------------------------------------
+        # -- CEL block --------------------------------------------------------
         f.write("\n  CEL:\n")
         f.write("    EXPRESSIONS:\n")
-        # All expression names strictly alphanumeric
         f.write(f"      Pmotin = {P_mot/1e5:.6f} [bar]\n")
         f.write(f"      Tmotin = {T_mot:.4f} [K]\n")
         f.write(f"      Psucin = {P_suc/1e5:.6f} [bar]\n")
         f.write(f"      Pout   = {P_out/1e5:.6f} [bar]\n")
+        # Stagnation enthalpies as fixed CEL constants
+        f.write(f"      H0mot  = {h0_mot:.4f} [J kg^-1]\n")
+        f.write(f"      H0suc  = {h0_suc:.4f} [J kg^-1]\n")
+        # Pressure ramp: Pstart is the ramp anchor (discharge pressure).
+        # PsucinRamp evaluates to Psucin immediately when no ramp is configured.
+        f.write(f"      Pstart = {P_out/1e5:.6f} [bar]\n")
+        f.write(f"      PsucinRamp = {ramp_cel}\n")
         f.write("    END\n")
 
-        # Material-property interpolation functions
+        # Material-property functions
         f.write("\n    # -- Material property functions (rho, mu per phase) ----\n")
         for phase, df_phase in _phases:
             for key, (col, units) in _MAT_FUNC_CATALOGUE.items():
                 _write_func(f, f"{phase}{key}", df_phase, col, units)
 
-        # AV interpolation functions (fn prefix keeps them distinct from AV names)
-        f.write("\n    # -- AV functions (per-phase thermodynamic state) --------\n")
+        # Per-phase isentrope AV functions
+        f.write("\n    # -- Per-phase isentrope AV functions -------------------\n")
         for phase, df_phase in _phases:
             for key, (col, units) in _AV_FUNC_CATALOGUE.items():
                 _write_func(f, f"fn{phase}{key}", df_phase, col, units)
 
-        f.write("  END\n")   # CEL
-        f.write("END\n\n")  # LIBRARY
+        # Saturation dome functions (path-independent, from dedicated df_sat)
+        f.write("\n    # -- Saturation dome functions (fnHlsat, fnHvsat, fnRhov) --\n")
+        f.write("    # Source: dedicated saturation grid [P_triple, P_crit-eps]\n")
+        f.write("    # Used by the enthalpy AV chain to locate mixture quality.\n")
+        for func_name, (col, units) in _SAT_FUNC_CATALOGUE.items():
+            _write_func(f, func_name, df_sat, col, units)
+
+        f.write("  END\n")    # CEL
+        f.write("END\n\n")   # LIBRARY
 
         # ======================================================================
-        # FLOW  (with &replace to fully substitute the domain in the .def)
+        # FLOW
         # ======================================================================
         f.write("# ============================================================\n")
-        f.write(f"# &replace DOMAIN: {domain}\n")
+        f.write(f"# FLOW -- &replace DOMAIN: {domain}\n")
         f.write("# ============================================================\n")
         f.write("FLOW: Flow Analysis 1\n")
         f.write(f"  &replace DOMAIN: {domain}\n")
@@ -340,7 +434,7 @@ def write_two_fluid_ccl(
         f.write( "    Domain Type = Fluid\n")
         f.write(f"    Location = {dom_loc}\n")
 
-        # -- Wall boundary (preserved from .def) --------------------------------
+        # Wall
         f.write(f"\n    BOUNDARY: {bc_wall}\n")
         f.write( "      Boundary Type = WALL\n")
         f.write( "      Create Other Side = Off\n")
@@ -356,7 +450,7 @@ def write_two_fluid_ccl(
         f.write( "      END\n")
         f.write( "    END\n")
 
-        # -- Motive inlet (Total Pressure) --------------------------------------
+        # Motive inlet (Total Pressure)
         f.write(f"\n    BOUNDARY: {bc_mot}\n")
         f.write( "      Boundary Type = INLET\n")
         f.write( "      Interface Boundary = Off\n")
@@ -376,12 +470,11 @@ def write_two_fluid_ccl(
         f.write( "          Option = Medium Intensity and Eddy Viscosity Ratio\n")
         f.write( "        END\n")
         f.write( "      END\n")
-        # Volume fractions — FLUID: block directly under BOUNDARY: (verified)
         _write_vf_fluid(f, "MotiveCO2",  "1.0")
         _write_vf_fluid(f, "SuctionCO2", "0.0")
         f.write( "    END\n")
 
-        # -- Suction inlet (Static Pressure) ------------------------------------
+        # Suction inlet (Static Pressure)
         f.write(f"\n    BOUNDARY: {bc_suc}\n")
         f.write( "      Boundary Type = INLET\n")
         f.write( "      Interface Boundary = Off\n")
@@ -394,8 +487,8 @@ def write_two_fluid_ccl(
         f.write( "          Option = Subsonic\n")
         f.write( "        END\n")
         f.write( "        MASS AND MOMENTUM:\n")
-        f.write( "          Option = Static Pressure\n")   # ← Static, not Total
-        f.write( "          Relative Pressure = Psucin\n")
+        f.write( "          Option = Static Pressure\n")
+        f.write( "          Relative Pressure = PsucinRamp\n")
         f.write( "        END\n")
         f.write( "        TURBULENCE:\n")
         f.write( "          Option = Medium Intensity and Eddy Viscosity Ratio\n")
@@ -405,9 +498,9 @@ def write_two_fluid_ccl(
         _write_vf_fluid(f, "SuctionCO2", "1.0")
         f.write( "    END\n")
 
-        # -- Outlet (Opening — allows reverse flow) -----------------------------
+        # Outlet (Opening)
         f.write(f"\n    BOUNDARY: {bc_out}\n")
-        f.write( "      Boundary Type = OPENING\n")      # ← OPENING, not OUTLET
+        f.write( "      Boundary Type = OPENING\n")
         f.write( "      Interface Boundary = Off\n")
         f.write(f"      Location = {bc_out_loc}\n")
         f.write( "      BOUNDARY CONDITIONS:\n")
@@ -418,7 +511,7 @@ def write_two_fluid_ccl(
         f.write( "          Option = Subsonic\n")
         f.write( "        END\n")
         f.write( "        MASS AND MOMENTUM:\n")
-        f.write( "          Option = Opening Pressure and Direction\n")  # ← verified
+        f.write( "          Option = Opening Pressure and Direction\n")
         f.write( "          Relative Pressure = Pout\n")
         f.write( "        END\n")
         f.write( "        TURBULENCE:\n")
@@ -429,7 +522,7 @@ def write_two_fluid_ccl(
         _write_vf_fluid(f, "SuctionCO2", "Zero Gradient")
         f.write( "    END\n")
 
-        # -- Symmetry planes ----------------------------------------------------
+        # Symmetry planes
         if symm1 and symm1_loc:
             f.write(f"\n    BOUNDARY: {symm1}\n")
             f.write( "      Boundary Type = SYMMETRY\n")
@@ -441,7 +534,7 @@ def write_two_fluid_ccl(
             f.write(f"      Location = {symm2_loc}\n")
             f.write( "    END\n")
 
-        # -- DOMAIN MODELS ------------------------------------------------------
+        # Domain models
         f.write("\n    DOMAIN MODELS:\n")
         f.write( "      BUOYANCY MODEL:\n")
         f.write( "        Option = Non Buoyant\n")
@@ -452,18 +545,16 @@ def write_two_fluid_ccl(
         f.write( "      MESH DEFORMATION:\n")
         f.write( "        Option = None\n")
         f.write( "      END\n")
-        # Reference pressure placement verified from working .def
         f.write( "      REFERENCE PRESSURE:\n")
         f.write( "        Reference Pressure = 0 [bar]\n")
         f.write( "      END\n")
         f.write( "    END\n")
 
-        # -- FLUID DEFINITIONS --------------------------------------------------
-        # Option = Material Library  ← verified token (not "Material", not "Mixture Component")
-        # MORPHOLOGY: sub-block      ← verified (not inline Morphology Option =)
+        # Fluid definitions
+        f.write("\n    # -- Fluid definitions ------------------------------------\n")
         for phase, _ in _phases:
             mat = f"{phase}CO2"
-            f.write(f"\n    FLUID DEFINITION: {mat}\n")
+            f.write(f"    FLUID DEFINITION: {mat}\n")
             f.write(f"      Material = {mat}\n")
             f.write( "      Option = Material Library\n")
             f.write( "      MORPHOLOGY:\n")
@@ -471,37 +562,72 @@ def write_two_fluid_ccl(
             f.write( "      END\n")
             f.write( "    END\n")
 
-        # -- FLUID MODELS -------------------------------------------------------
+        # ── FLUID MODELS ───────────────────────────────────────────────────────
         f.write("\n    FLUID MODELS:\n")
 
-        # Step 1: Declare every AV as Fluid Dependent at the top of FLUID MODELS
-        # (verified pattern from working CCL — all 8 AVs declared before any FLUID block)
-        f.write("      # -- AV declarations (Fluid Dependent) -------------------\n")
+        # Step 1: Declare ALL AVs as Fluid Dependent (per-phase + enthalpy chain)
+        f.write("      # -- AV declarations (Fluid Dependent) ------------------\n")
         for phase, _ in _phases:
             for key in _AV_FUNC_CATALOGUE:
-                av_name = f"{phase}{key}"
-                f.write(f"      ADDITIONAL VARIABLE: {av_name}\n")
+                f.write(f"      ADDITIONAL VARIABLE: {phase}{key}\n")
                 f.write( "        Option = Fluid Dependent\n")
                 f.write( "      END\n")
+        for av_name in _ENTHALPY_AV_CATALOGUE:
+            f.write(f"      ADDITIONAL VARIABLE: {av_name}\n")
+            f.write( "        Option = Fluid Dependent\n")
+            f.write( "      END\n")
 
         f.write( "      COMBUSTION MODEL:\n")
         f.write( "        Option = None\n")
         f.write( "      END\n")
 
-        # Step 2: Per-fluid FLUID: block with Algebraic Equation for that phase's AVs
-        # (verified: Motive AVs → FLUID: MotiveCO2, Suction AVs → FLUID: SuctionCO2)
-        f.write("      # -- Per-fluid AV algebraic equations --------------------\n")
-        for phase, _ in _phases:
-            mat = f"{phase}CO2"
-            f.write(f"      FLUID: {mat}\n")
-            for key in _AV_FUNC_CATALOGUE:
-                av_name   = f"{phase}{key}"
-                func_call = f"fn{phase}{key}(Absolute Pressure)"
-                f.write(f"        ADDITIONAL VARIABLE: {av_name}\n")
-                f.write(f"          Additional Variable Value = {func_call}\n")
-                f.write( "          Option = Algebraic Equation\n")
-                f.write( "        END\n")
-            f.write( "      END\n")   # FLUID
+
+        # CFX rule: Fluid Dependent AV needs to be defined in AT LEAST ONE fluid.
+        # Assigning the "wrong" phase AV as 0.0 in the other fluid causes a
+        # unit-mismatch error (0.0 is dimensionless; SoS expects m s^-1 etc).
+        # Correct: each phase AV only in its own fluid block.
+        # Mixture AVs carry the same equation in both blocks.
+
+        _enth_eqs = [
+            ("RhoMix",
+             "MotiveCO2.Volume Fraction * MotiveRho(Absolute Pressure) "
+             "+ SuctionCO2.Volume Fraction * SuctionRho(Absolute Pressure)"),
+            ("Ymot",
+             "(MotiveCO2.Volume Fraction * MotiveRho(Absolute Pressure)) "
+             "/ RhoMix"),
+            ("Hmix",
+             "Ymot * H0mot + (1.0 - Ymot) * H0suc "
+             "- 0.5 * (Velocity u^2 + Velocity v^2 + Velocity w^2)"),
+            ("Xmix",
+             "max(0.0, min(1.0, "
+             "(Hmix - fnHlsat(Absolute Pressure)) "
+             "/ (fnHvsat(Absolute Pressure) - fnHlsat(Absolute Pressure))))"),
+            ("VfVapMix",
+             "(Xmix * RhoMix) / fnRhov(Absolute Pressure)"),
+        ]
+
+        def _write_av_eq(f, av_name, expr, indent=8):
+            pad = " " * indent
+            f.write(f"{pad}ADDITIONAL VARIABLE: {av_name}\n")
+            f.write(f"{pad}  Additional Variable Value = {expr}\n")
+            f.write(f"{pad}  Option = Algebraic Equation\n")
+            f.write(f"{pad}END\n")
+
+        f.write("      # -- FLUID: MotiveCO2 -- Motive isentrope AVs + mixture AVs\n")
+        f.write("      FLUID: MotiveCO2\n")
+        for key in _AV_FUNC_CATALOGUE:
+            _write_av_eq(f, f"Motive{key}", f"fnMotive{key}(Absolute Pressure)")
+        for av_name, eq in _enth_eqs:
+            _write_av_eq(f, av_name, eq)
+        f.write("      END\n")
+
+        f.write("      # -- FLUID: SuctionCO2 -- Suction isentrope AVs + mixture AVs\n")
+        f.write("      FLUID: SuctionCO2\n")
+        for key in _AV_FUNC_CATALOGUE:
+            _write_av_eq(f, f"Suction{key}", f"fnSuction{key}(Absolute Pressure)")
+        for av_name, eq in _enth_eqs:
+            _write_av_eq(f, av_name, eq)
+        f.write("      END\n")
 
         f.write( "      HEAT TRANSFER MODEL:\n")
         f.write(f"        Fluid Temperature = {T_fluid:.1f} [K]\n")
@@ -519,7 +645,7 @@ def write_two_fluid_ccl(
         f.write( "      END\n")
         f.write( "    END\n")   # FLUID MODELS
 
-        # -- FLUID PAIR (top-level domain block — verified) ---------------------
+        # Fluid pair (top-level domain block)
         f.write("\n    FLUID PAIR: MotiveCO2 | SuctionCO2\n")
         f.write( "      INTERPHASE TRANSFER MODEL:\n")
         f.write( "        Option = None\n")
@@ -529,8 +655,7 @@ def write_two_fluid_ccl(
         f.write( "      END\n")
         f.write( "    END\n")
 
-        # -- MULTIPHASE MODELS (top-level domain block — verified) --------------
-        # Homogeneous Model = On  is a FLAG, not "Option = Homogeneous"
+        # Multiphase models (top-level domain block)
         f.write("\n    MULTIPHASE MODELS:\n")
         f.write( "      Homogeneous Model = On\n")
         f.write( "      FREE SURFACE MODEL:\n")
@@ -539,16 +664,131 @@ def write_two_fluid_ccl(
         f.write( "    END\n")
 
         f.write( "  END\n")   # DOMAIN
-        f.write( "END\n")    # FLOW
+        f.write( "END\n\n")  # FLOW (domain)
 
-    n_av  = 2 * len(_AV_FUNC_CATALOGUE)
-    n_mat = 2 * len(_MAT_FUNC_CATALOGUE)
+        # ── Each top-level control block gets its OWN FLOW: wrapper ──────────
+        # Rule: sub-blocks NEVER carry &replace — only the immediate child
+        #       of FLOW: does.  Nested &replace causes "empty context rule" errors
+        #       because CFX cannot resolve the parameter schema without the full
+        #       parent block context being present.
+
+        # ── SOLUTION UNITS ─────────────────────────────────────────────────────
+        f.write("FLOW: Flow Analysis 1\n")
+        f.write("  &replace SOLUTION UNITS:\n")
+        f.write("    Angle Units = [rad]\n")
+        f.write("    Length Units = [m]\n")
+        f.write("    Mass Units = [kg]\n")
+        f.write("    Solid Angle Units = [sr]\n")
+        f.write("    Temperature Units = [K]\n")
+        f.write("    Time Units = [s]\n")
+        f.write("  END\n")
+        f.write("END\n\n")
+
+        # ── SOLVER CONTROL ─────────────────────────────────────────────────────
+        # Complete sub-block set required — CFX schema validates ALL siblings
+        # before resolving any individual parameter (hence the context error).
+        f.write("FLOW: Flow Analysis 1\n")
+        f.write("  &replace SOLVER CONTROL:\n")
+        f.write("    Turbulence Numerics = High Resolution\n")
+        f.write("    ADVECTION SCHEME:\n")
+        f.write("      Option = High Resolution\n")
+        f.write("    END\n")
+        f.write("    COMPRESSIBILITY CONTROL:\n")
+        f.write("      Clip Pressure for Properties = On\n")
+        f.write("      High Speed Numerics = On\n")
+        f.write("      Minimum Pressure for Properties = 0 [Pa]\n")
+        f.write("    END\n")
+        f.write("    CONVERGENCE CONTROL:\n")
+        f.write("      Length Scale Option = Conservative\n")
+        f.write(f"      Maximum Number of Iterations = {max_iter}\n")
+        f.write("      Minimum Number of Iterations = 1\n")
+        f.write("      Timescale Control = Auto Timescale\n")
+        f.write("      Timescale Factor = 1.0\n")
+        f.write("    END\n")
+        f.write("    CONVERGENCE CRITERIA:\n")
+        f.write("      Conservation Target = 0.001\n")
+        f.write("      Residual Target = 0.0001\n")
+        f.write("      Residual Type = MAX\n")
+        f.write("    END\n")
+        f.write("    DYNAMIC MODEL CONTROL:\n")
+        f.write("      Global Dynamic Model Control = On\n")
+        f.write("    END\n")
+        f.write("    INTERRUPT CONTROL:\n")
+        f.write("      Option = All Interrupts\n")
+        f.write("      CONVERGENCE CONDITIONS:\n")
+        f.write("        Option = Default Conditions\n")
+        f.write("      END\n")
+        f.write("    END\n")
+        f.write("    MULTIPHASE CONTROL:\n")
+        f.write("      Initial Volume Fraction Smoothing = Volume-Weighted\n")
+        f.write("      Volume Fraction Coupling = Coupled\n")
+        f.write("    END\n")
+        f.write("    VELOCITY PRESSURE COUPLING:\n")
+        f.write("      Rhie Chow Option = Fourth Order\n")
+        f.write("    END\n")
+        f.write("  END\n")
+        f.write("END\n\n")
+
+        # ── OUTPUT CONTROL ─────────────────────────────────────────────────────
+        f.write("FLOW: Flow Analysis 1\n")
+        f.write("  &replace OUTPUT CONTROL:\n")
+        f.write("    BACKUP DATA RETENTION:\n")
+        f.write("      Option = Delete Old Files\n")
+        f.write("    END\n")
+        # Name must be "Backup Results" — verified from working GUI CCL
+        f.write("    BACKUP RESULTS: Backup Results\n")
+        f.write("      File Compression Level = Default\n")
+        f.write("      Option = Standard\n")
+        f.write("      OUTPUT FREQUENCY:\n")
+        f.write(f"        Iteration Interval = {backup_interval}\n")
+        f.write("        Option = Iteration Interval\n")
+        f.write("      END\n")
+        f.write("    END\n")   # BACKUP RESULTS
+        f.write("    MONITOR OBJECTS:\n")
+        f.write("      MONITOR BALANCES:\n")
+        f.write("        Option = Full\n")
+        f.write("      END\n")
+        f.write("      MONITOR FORCES:\n")
+        f.write("        Option = Full\n")
+        f.write("      END\n")
+        f.write("      MONITOR PARTICLES:\n")
+        f.write("        Option = Full\n")
+        f.write("      END\n")
+        f.write("      MONITOR RESIDUALS:\n")
+        f.write("        Option = Full\n")
+        f.write("      END\n")
+        f.write("      MONITOR TOTALS:\n")
+        f.write("        Option = Full\n")
+        f.write("      END\n")
+        f.write("    END\n")   # MONITOR OBJECTS
+        f.write("    RESULTS:\n")
+        f.write("      File Compression Level = Default\n")
+        f.write("      Option = Standard\n")
+        f.write("    END\n")
+        f.write("  END\n")    # OUTPUT CONTROL
+        f.write("END\n\n")
+
+        # ── EXPERT PARAMETERS ──────────────────────────────────────────────────
+        # solve energy = f  disables the energy equation — correct for an
+        # isothermal barotropic model where h(P) is already embedded in the
+        # property tables and the enthalpy AV chain.
+        f.write("FLOW: Flow Analysis 1\n")
+        f.write("  &replace EXPERT PARAMETERS:\n")
+        f.write("    solve energy = f\n")
+        f.write("  END\n")
+        f.write("END\n")
+
+    n_mat  = 2 * len(_MAT_FUNC_CATALOGUE)
+    n_av   = 2 * len(_AV_FUNC_CATALOGUE)
+    n_sat  = len(_SAT_FUNC_CATALOGUE)
+    n_enth = len(_ENTHALPY_AV_CATALOGUE)
     print(f"[Pipeline] CCL written: {filename}  "
-          f"({n_mat} material funcs + {n_av} AV funcs, UTF-8, &replace)")
+          f"({n_mat} mat + {n_av} isentrope AV + {n_sat} sat + "
+          f"{n_enth} enthalpy AVs, UTF-8, &replace)")
 
 
 # ================================================================================
-# 4.  CSE POST-PROCESSING SCRIPT
+# 4.  CSE POST-PROCESSING SCRIPT  (20 columns)
 # ================================================================================
 
 def write_two_fluid_cse(
@@ -561,15 +801,13 @@ def write_two_fluid_cse(
     """
     Generate a CFX-Post CSE script for Two-Fluid axial profile extraction.
 
-    Volume Fraction variable names in CFX-Post follow the fluid definition
-    names exactly:  Volume Fraction.MotiveCO2  and  Volume Fraction.SuctionCO2
+    Columns A-O  : existing isentrope / VF quantities
+    Columns P-T  : new enthalpy chain quantities (RhoMix, Ymot, Hmix, Xmix, VfVapMix)
+    Total        : 20 columns
 
-    AV names in evaluate() must match ADDITIONAL VARIABLE names in the CCL
-    (alphanumeric, no underscores).
-
-    Mixture reconstruction (Perl arithmetic):
-        AlphaVmix = VFMotive * MotiveAlphaV + VFSuction * SuctionAlphaV
-        SoSmix    = VFMotive * MotiveSoS    + VFSuction * SuctionSoS
+    AV names in evaluate() match the ADDITIONAL VARIABLE names in the CCL exactly.
+    Volume Fraction field names in CFX-Post include the fluid definition name:
+        Volume Fraction.MotiveCO2 / Volume Fraction.SuctionCO2
     """
     csv_name  = os.path.splitext(os.path.basename(filename))[0] + ".csv"
     p_mot_bar = config["P_mot_in"] / 1e5
@@ -581,10 +819,9 @@ def write_two_fluid_cse(
 #   CFX Post Version = 24.2
 #   Two-Fluid Barotropic CO2 Ejector -- axial profile extraction
 #   Motive : {p_mot_bar:.3f} bar / {t_mot_c:.2f} C  (Total Pressure inlet)
-#   Suction: {p_suc_bar:.3f} bar  (Static Pressure inlet)
+#   Suction: {p_suc_bar:.3f} bar  (Static Pressure inlet, table extends to motive P)
 #   Outlet : {p_out_bar:.3f} bar  (Opening)
-#   Fluid names: MotiveCO2, SuctionCO2
-#   AV names   : MotiveAlphaV, SuctionSoS, etc. (alphanumeric)
+#   Enthalpy AVs: RhoMix, Ymot, Hmix, Xmix[0,1], VfVapMix
 # END
 
 !$x_min = {x_min};
@@ -604,16 +841,16 @@ def write_two_fluid_cse(
         Range       = Global
     END
 
-    # Primitive flow variables
+    # -- Primitive flow variables -----------------------------------------------
     !($p_stat, $u) = evaluate("ave(Absolute Pressure)\\@X_slice");
     !($rho,    $u) = evaluate("ave(Density)\\@X_slice");
     !($vel,    $u) = evaluate("ave(Velocity)\\@X_slice");
 
-    # Volume fractions — CFX-Post variable name includes fluid definition name
+    # -- Volume fractions -------------------------------------------------------
     !($vf_mot, $u) = evaluate("ave(Volume Fraction.MotiveCO2)\\@X_slice");
     !($vf_suc, $u) = evaluate("ave(Volume Fraction.SuctionCO2)\\@X_slice");
 
-    # Per-phase thermodynamic AVs (alphanumeric names match CCL exactly)
+    # -- Per-phase isentrope AVs (alphanumeric names) ---------------------------
     !($mot_av,  $u) = evaluate("ave(MotiveAlphaV)\\@X_slice");
     !($suc_av,  $u) = evaluate("ave(SuctionAlphaV)\\@X_slice");
     !($mot_sos, $u) = evaluate("ave(MotiveSoS)\\@X_slice");
@@ -623,7 +860,14 @@ def write_two_fluid_cse(
     !($mot_xl,  $u) = evaluate("ave(MotiveXlsat)\\@X_slice");
     !($suc_xl,  $u) = evaluate("ave(SuctionXlsat)\\@X_slice");
 
-    # Mixture reconstruction (volume-fraction weighted)
+    # -- Enthalpy mixture reconstruction AVs -----------------------------------
+    !($rhomix,   $u) = evaluate("ave(RhoMix)\\@X_slice");
+    !($ymot,     $u) = evaluate("ave(Ymot)\\@X_slice");
+    !($hmix,     $u) = evaluate("ave(Hmix)\\@X_slice");
+    !($xmix,     $u) = evaluate("ave(Xmix)\\@X_slice");
+    !($vfvapmix, $u) = evaluate("ave(VfVapMix)\\@X_slice");
+
+    # -- Isentrope mixture reconstruction (VF-weighted, for comparison) --------
     !$av_mix  = $vf_mot * $mot_av  + $vf_suc * $suc_av;
     !$sos_mix = $vf_mot * $mot_sos + $vf_suc * $suc_sos;
     !if ($sos_mix > 1.0) {{ $mach = $vel / $sos_mix; }} else {{ $mach = 0.0; }}
@@ -647,6 +891,11 @@ def write_two_fluid_cse(
             M1 = "Xv_suc [-]",      False, False, False, Left, True, 0, Font Name, 1|1, %10.4e, True, ffffff, 000000, True
             N1 = "Xlsat_mot [-]",   False, False, False, Left, True, 0, Font Name, 1|1, %10.4e, True, ffffff, 000000, True
             O1 = "Xlsat_suc [-]",   False, False, False, Left, True, 0, Font Name, 1|1, %10.4e, True, ffffff, 000000, True
+            P1 = "RhoMix [kg/m3]",  False, False, False, Left, True, 0, Font Name, 1|1, %10.4e, True, ffffff, 000000, True
+            Q1 = "Ymot [-]",        False, False, False, Left, True, 0, Font Name, 1|1, %10.4e, True, ffffff, 000000, True
+            R1 = "Hmix [J/kg]",     False, False, False, Left, True, 0, Font Name, 1|1, %10.4e, True, ffffff, 000000, True
+            S1 = "Xmix [-]",        False, False, False, Left, True, 0, Font Name, 1|1, %10.4e, True, ffffff, 000000, True
+            T1 = "VfVapMix [-]",    False, False, False, Left, True, 0, Font Name, 1|1, %10.4e, True, ffffff, 000000, True
           END
         END
     !}}
@@ -654,21 +903,26 @@ def write_two_fluid_cse(
     TABLE: TwoFluid_Profile
       Table Exists = True
       TABLE CELLS:
-        A$row = "$x_val",   False, False, False, Left, True, 0, Font Name, 1|1, %10.4e, True, ffffff, 000000, True
-        B$row = "$p_stat",  False, False, False, Left, True, 0, Font Name, 1|1, %10.4e, True, ffffff, 000000, True
-        C$row = "$rho",     False, False, False, Left, True, 0, Font Name, 1|1, %10.4e, True, ffffff, 000000, True
-        D$row = "$vel",     False, False, False, Left, True, 0, Font Name, 1|1, %10.4e, True, ffffff, 000000, True
-        E$row = "$sos_mix", False, False, False, Left, True, 0, Font Name, 1|1, %10.4e, True, ffffff, 000000, True
-        F$row = "$mach",    False, False, False, Left, True, 0, Font Name, 1|1, %10.4e, True, ffffff, 000000, True
-        G$row = "$vf_mot",  False, False, False, Left, True, 0, Font Name, 1|1, %10.4e, True, ffffff, 000000, True
-        H$row = "$vf_suc",  False, False, False, Left, True, 0, Font Name, 1|1, %10.4e, True, ffffff, 000000, True
-        I$row = "$mot_av",  False, False, False, Left, True, 0, Font Name, 1|1, %10.4e, True, ffffff, 000000, True
-        J$row = "$suc_av",  False, False, False, Left, True, 0, Font Name, 1|1, %10.4e, True, ffffff, 000000, True
-        K$row = "$av_mix",  False, False, False, Left, True, 0, Font Name, 1|1, %10.4e, True, ffffff, 000000, True
-        L$row = "$mot_xv",  False, False, False, Left, True, 0, Font Name, 1|1, %10.4e, True, ffffff, 000000, True
-        M$row = "$suc_xv",  False, False, False, Left, True, 0, Font Name, 1|1, %10.4e, True, ffffff, 000000, True
-        N$row = "$mot_xl",  False, False, False, Left, True, 0, Font Name, 1|1, %10.4e, True, ffffff, 000000, True
-        O$row = "$suc_xl",  False, False, False, Left, True, 0, Font Name, 1|1, %10.4e, True, ffffff, 000000, True
+        A$row = "$x_val",    False, False, False, Left, True, 0, Font Name, 1|1, %10.4e, True, ffffff, 000000, True
+        B$row = "$p_stat",   False, False, False, Left, True, 0, Font Name, 1|1, %10.4e, True, ffffff, 000000, True
+        C$row = "$rho",      False, False, False, Left, True, 0, Font Name, 1|1, %10.4e, True, ffffff, 000000, True
+        D$row = "$vel",      False, False, False, Left, True, 0, Font Name, 1|1, %10.4e, True, ffffff, 000000, True
+        E$row = "$sos_mix",  False, False, False, Left, True, 0, Font Name, 1|1, %10.4e, True, ffffff, 000000, True
+        F$row = "$mach",     False, False, False, Left, True, 0, Font Name, 1|1, %10.4e, True, ffffff, 000000, True
+        G$row = "$vf_mot",   False, False, False, Left, True, 0, Font Name, 1|1, %10.4e, True, ffffff, 000000, True
+        H$row = "$vf_suc",   False, False, False, Left, True, 0, Font Name, 1|1, %10.4e, True, ffffff, 000000, True
+        I$row = "$mot_av",   False, False, False, Left, True, 0, Font Name, 1|1, %10.4e, True, ffffff, 000000, True
+        J$row = "$suc_av",   False, False, False, Left, True, 0, Font Name, 1|1, %10.4e, True, ffffff, 000000, True
+        K$row = "$av_mix",   False, False, False, Left, True, 0, Font Name, 1|1, %10.4e, True, ffffff, 000000, True
+        L$row = "$mot_xv",   False, False, False, Left, True, 0, Font Name, 1|1, %10.4e, True, ffffff, 000000, True
+        M$row = "$suc_xv",   False, False, False, Left, True, 0, Font Name, 1|1, %10.4e, True, ffffff, 000000, True
+        N$row = "$mot_xl",   False, False, False, Left, True, 0, Font Name, 1|1, %10.4e, True, ffffff, 000000, True
+        O$row = "$suc_xl",   False, False, False, Left, True, 0, Font Name, 1|1, %10.4e, True, ffffff, 000000, True
+        P$row = "$rhomix",   False, False, False, Left, True, 0, Font Name, 1|1, %10.4e, True, ffffff, 000000, True
+        Q$row = "$ymot",     False, False, False, Left, True, 0, Font Name, 1|1, %10.4e, True, ffffff, 000000, True
+        R$row = "$hmix",     False, False, False, Left, True, 0, Font Name, 1|1, %10.4e, True, ffffff, 000000, True
+        S$row = "$xmix",     False, False, False, Left, True, 0, Font Name, 1|1, %10.4e, True, ffffff, 000000, True
+        T$row = "$vfvapmix", False, False, False, Left, True, 0, Font Name, 1|1, %10.4e, True, ffffff, 000000, True
       END
     END
 
@@ -678,7 +932,7 @@ def write_two_fluid_cse(
 """
     with open(filename, "w", encoding="utf-8") as fh:
         fh.write(cse)
-    print(f"[Pipeline] CSE written: {filename}  ({n_slices} slices, 15 cols, UTF-8)")
+    print(f"[Pipeline] CSE written: {filename}  ({n_slices} slices, 20 cols, UTF-8)")
 
 
 # ================================================================================
@@ -699,67 +953,106 @@ def run_two_fluid_pipeline(config: dict) -> tuple:
     """
     Full pre-processing pipeline for one operating point.
 
+    Suction table P_max is set to P_mot_in (extended range) so that
+    SuctionRho / SuctionMu are valid across the full mixing-section
+    pressure range.  The isentrope entropy is still s(P_suc_in, T_suc_in).
+
     Returns
     -------
-    (df_mot, df_suc, excel_mot, excel_suc, ccl, cse, plot_mot, plot_suc)
+    (df_mot, df_suc, df_sat,
+     excel_mot, excel_suc, excel_sat,
+     ccl, cse, plot_mot, plot_suc)
     """
     case  = _build_case_name(config)
     fluid = config["Fluid"]
 
     excel_mot = f"{case}_Motive_Table.xlsx"
     excel_suc = f"{case}_Suction_Table.xlsx"
+    excel_sat = f"{case}_Saturation_Table.xlsx"
     ccl_name  = f"{case}_Physics.ccl"
     cse_name  = f"{case}_PostProcess.cse"
 
-    df_mot = generate_equilibrium_table(
-        P_in=config["P_mot_in"], T_in=config["T_mot_in"],
-        fluid=fluid, label="Motive",
+    # 1. Motive isentrope table (standard: P_max = P_mot_in)
+    df_mot, h0_mot = generate_equilibrium_table(
+        P_in=config["P_mot_in"],
+        T_in=config["T_mot_in"],
+        fluid=fluid,
+        label="Motive",
     )
-    df_suc = generate_equilibrium_table(
-        P_in=config["P_suc_in"], T_in=config["T_suc_in"],
-        fluid=fluid, label="Suction",
+
+    # 2. Suction isentrope table (EXTENDED: grid P_max = P_mot_in)
+    #    Isentrope anchor remains at (P_suc_in, T_suc_in).
+    #    The higher P_max makes SuctionRho/Mu valid in the mixing section
+    #    where static pressure may exceed P_suc_in during compression.
+    df_suc, h0_suc = generate_equilibrium_table(
+        P_in  = config["P_suc_in"],
+        T_in  = config["T_suc_in"],
+        fluid = fluid,
+        P_max = config["P_mot_in"],   # ← extended range
+        label = "Suction",
     )
 
     if df_mot is None or df_suc is None:
-        raise RuntimeError("Table generation failed.")
+        raise RuntimeError("Isentrope table generation failed.")
+
+    # 3. Saturation table — dedicated dome-property grid for CCL functions
+    df_sat = generate_saturation_table(
+        P_max=config["P_mot_in"], fluid=fluid, label="sat",
+    )
 
     print_table_summary(df_mot, "Motive")
     print_table_summary(df_suc, "Suction")
+    print(f"\n  [h0] Motive  = {h0_mot/1e3:.3f} kJ/kg\n"
+          f"  [h0] Suction = {h0_suc/1e3:.3f} kJ/kg")
 
+    # 4. Excel audit files
     df_mot.to_excel(excel_mot, index=False, sheet_name="Motive_Isentrope")
     df_suc.to_excel(excel_suc, index=False, sheet_name="Suction_Isentrope")
-    print(f"[Pipeline] Excel: {excel_mot}, {excel_suc}")
+    df_sat.to_excel(excel_sat, index=False, sheet_name="Saturation_Dome")
+    print(f"[Pipeline] Excel: {excel_mot}, {excel_suc}, {excel_sat}")
 
+    # 5. Verification plots
     plot_mot = f"{case}_SoS_Motive.png"
     plot_suc = f"{case}_SoS_Suction.png"
     try:
         fig = plot_sos_comparison(df_mot, label="Motive",  save_path=plot_mot)
         plt.close(fig)
-        fig = plot_sos_comparison(df_suc, label="Suction", save_path=plot_suc)
+        fig = plot_sos_comparison(df_suc, label="Suction (extended)",
+                                  save_path=plot_suc)
         plt.close(fig)
     except Exception as exc:
         print(f"  [Warning] Verification plot failed: {exc}")
         plot_mot = plot_suc = None
 
-    write_two_fluid_ccl(ccl_name, df_mot, df_suc, config)
+    # 6. CCL
+    write_two_fluid_ccl(
+        ccl_name, df_mot, df_suc, df_sat, config,
+        h0_mot=h0_mot, h0_suc=h0_suc,
+    )
+
+    # 7. CSE
     write_two_fluid_cse(cse_name, config)
 
-    return df_mot, df_suc, excel_mot, excel_suc, ccl_name, cse_name, plot_mot, plot_suc
+    return (df_mot, df_suc, df_sat,
+            excel_mot, excel_suc, excel_sat,
+            ccl_name, cse_name, plot_mot, plot_suc)
 
 
 def run_two_fluid_pipeline_in_folder(config: dict, base_dir: str = ".") -> str:
     """
-    Run pipeline, move outputs to case folder, write run_case.sh.
+    Run pipeline, move all outputs to a dedicated case folder, write run_case.sh.
     Returns absolute path to the bash script.
     """
-    df_mot, df_suc, excel_mot, excel_suc, ccl, cse, plot_mot, plot_suc = \
-        run_two_fluid_pipeline(config)
+    (df_mot, df_suc, df_sat,
+     excel_mot, excel_suc, excel_sat,
+     ccl, cse, plot_mot, plot_suc) = run_two_fluid_pipeline(config)
 
     case     = _build_case_name(config)
     case_dir = os.path.join(base_dir, case)
     os.makedirs(case_dir, exist_ok=True)
 
-    for fname in [excel_mot, excel_suc, ccl, cse, plot_mot, plot_suc]:
+    all_files = [excel_mot, excel_suc, excel_sat, ccl, cse, plot_mot, plot_suc]
+    for fname in all_files:
         if fname and os.path.exists(fname):
             shutil.move(fname, os.path.join(case_dir, os.path.basename(fname)))
 
@@ -775,8 +1068,10 @@ def run_two_fluid_pipeline_in_folder(config: dict, base_dir: str = ".") -> str:
 # Auto-generated Two-Fluid run script
 # Case  : {case}
 # CCL   : {ccl}
-#   Uses &replace DOMAIN — fully substitutes domain in .def
-#   Reference Pressure = 0 bar (Absolute Pressure tables)
+#   &replace DOMAIN -- fully substitutes domain in .def
+#   Reference Pressure = 0 [bar]
+#   Suction table extends to P_mot_in for mixing-section validity
+#   Enthalpy AVs: RhoMix -> Ymot -> Hmix -> Xmix[0,1] -> VfVapMix
 # ============================================================
 
 cd "{os.path.abspath(case_dir)}"

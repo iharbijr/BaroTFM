@@ -5,8 +5,10 @@ Physics engine for the Two-Fluid Barotropic CO2 ejector model.
 
 Key design decisions (locked):
   - EQUILIBRIUM isentrope only — no NEB / metastable physics.
-  - One isentrope per fluid inlet: s_mot = f(P_mot_in, T_mot_in)
-                                   s_suc = f(P_suc_in, T_suc_in)
+  - Motive isentrope : s_mot = f(P_mot_in, T_mot_in), grid P_triple → P_mot_in
+  - Suction isentrope: s_suc = f(P_suc_in, T_suc_in), grid P_triple → P_mot_in
+      Grid upper bound is P_mot_in (not P_suc_in) so SuctionRho / SuctionMu
+      remain valid during compression in the mixing section.
   - Stretched pressure grid: dense band of ±5 bar around P_crit.
   - CoolProp HEOS backend used throughout.
 
@@ -23,6 +25,20 @@ Speed of Sound — HEM fully-relaxed formulation (two-phase region):
   Single-phase: formula reduces to standard CoolProp acoustic speed.
   Critical-point guard: HEM is bypassed within ±0.3 bar of P_crit to
   prevent Cp/density singularity overflow; CoolProp SoS is substituted.
+
+generate_equilibrium_table now returns (df, h0):
+  df : property DataFrame
+  h0 : inlet stagnation enthalpy [J kg^-1] = h(P_in, T_in)
+
+Saturation building blocks added to each DataFrame row:
+  Hlsat  [J kg^-1]   h_l(P)   saturated liquid enthalpy
+  Hvsat  [J kg^-1]   h_v(P)   saturated vapour enthalpy
+  Rhov   [kg m^-3]   rho_v(P) saturated vapour density
+  Values are 0.0 for single-phase / supercritical rows (out of dome).
+
+generate_saturation_table provides a dedicated dome-property table on a
+pressure grid [P_triple, min(P_crit - eps, P_max)] for use as CCL
+interpolation functions fnHlsat, fnHvsat, fnRhov.
 
 Author: auto-generated for Ahmed's cfx_writer / NEB pipeline
 """
@@ -92,30 +108,14 @@ def _sat_entropy_derivatives(
     """
     Compute ds_l/dP and ds_v/dP strictly along the saturation curve.
 
-    Method: central finite difference at fixed quality.
+    Central finite difference at fixed quality:
       ds_l/dP ~ [s_l(P+dP) - s_l(P-dP)] / (2*dP)   with Q=0 fixed
       ds_v/dP ~ [s_v(P+dP) - s_v(P-dP)] / (2*dP)   with Q=1 fixed
-
-    This is categorically different from differentiating along the isentrope.
-    The isentrope determines WHICH pressures we visit; these derivatives
-    measure how the saturation boundary moves as pressure changes.
-
-    Parameters
-    ----------
-    P     : float  Saturation pressure [Pa]
-    fluid : str    CoolProp fluid string
-    dP    : float  Half-step for central difference [Pa]  (default 10 Pa)
-
-    Returns
-    -------
-    ds_l_dP, ds_v_dP : [J kg^-1 K^-1 Pa^-1]
     """
-    # Liquid saturation line  (Q=0 throughout)
     s_l_p = float(CP.PropsSI("S", "P", P + dP, "Q", 0, fluid))
     s_l_m = float(CP.PropsSI("S", "P", P - dP, "Q", 0, fluid))
     ds_l_dP = (s_l_p - s_l_m) / (2.0 * dP)
 
-    # Vapour saturation line  (Q=1 throughout)
     s_v_p = float(CP.PropsSI("S", "P", P + dP, "Q", 1, fluid))
     s_v_m = float(CP.PropsSI("S", "P", P - dP, "Q", 1, fluid))
     ds_v_dP = (s_v_p - s_v_m) / (2.0 * dP)
@@ -134,70 +134,36 @@ def _hem_sos_two_phase(
     """
     Fully-relaxed HEM speed of sound for a two-phase state.
 
-    Formula
-    -------
-    1 / (rho_mix * c_eq^2)
-        = alpha_l / (rho_l * c_l^2)  +  alpha_v / (rho_v * c_v^2)     [mechanical]
-        + T * [ alpha_l * rho_l * (ds_l/dP)^2 / Cp_l
-               + alpha_v * rho_v * (ds_v/dP)^2 / Cp_v ]               [thermal]
-
-    Volume fraction derivation (from mass+volume balance simultaneously):
-        alpha_v = x_v * rho_mix / rho_v
-        alpha_l = 1 - alpha_v
-
-    Single-phase limits:
-        alpha_v -> 0  => c_eq -> c_l  (pure liquid, thermal term -> 0 because
-                                        alpha_v=0 and alpha_l=1 but ds_l/dP is
-                                        evaluated ON the sat. curve so this is
-                                        only exact at exactly Q=0)
-        alpha_v -> 1  => c_eq -> c_v  (pure vapour, similarly)
-
-    Returns
-    -------
-    c_hem : float [m/s], or None if any guard condition triggers.
-
-    None is returned (rather than raising) so the caller can substitute
-    the CoolProp value cleanly without branching on exception type.
+    Returns c_hem [m/s], or None if any guard condition triggers.
     """
-    # ── Saturation boundary properties ────────────────────────────────────────
-    rho_l = float(CP.PropsSI("D",  "P", P, "Q", 0, fluid))
-    rho_v = float(CP.PropsSI("D",  "P", P, "Q", 1, fluid))
-    c_l   = float(CP.PropsSI("d(P)/d(D)|S",  "P", P, "Q", 0, fluid))**0.5   # frozen phase SoS
-    c_v   = float(CP.PropsSI("d(P)/d(D)|S",  "P", P, "Q", 1, fluid))**0.5
-    Cp_l  = float(CP.PropsSI("C",  "P", P, "Q", 0, fluid))
-    Cp_v  = float(CP.PropsSI("C",  "P", P, "Q", 1, fluid))
+    rho_l = float(CP.PropsSI("D",            "P", P, "Q", 0, fluid))
+    rho_v = float(CP.PropsSI("D",            "P", P, "Q", 1, fluid))
+    c_l   = float(CP.PropsSI("d(P)/d(D)|S",  "P", P, "Q", 0, fluid)) ** 0.5
+    c_v   = float(CP.PropsSI("d(P)/d(D)|S",  "P", P, "Q", 1, fluid)) ** 0.5
+    Cp_l  = float(CP.PropsSI("C",            "P", P, "Q", 0, fluid))
+    Cp_v  = float(CP.PropsSI("C",            "P", P, "Q", 1, fluid))
 
-    # ── Guard: unphysical saturation properties signal critical singularity ────
     if (c_l <= 0.0 or c_v <= 0.0 or Cp_l <= 0.0 or Cp_v <= 0.0
             or not np.isfinite(Cp_l) or not np.isfinite(Cp_v)
             or not np.isfinite(c_l)  or not np.isfinite(c_v)):
         return None
 
-    # ── Volume fractions (mass+volume balance) ────────────────────────────────
     alpha_v = float(np.clip(x_v * rho_mix / rho_v, 0.0, 1.0))
     alpha_l = 1.0 - alpha_v
 
-    # ── Saturation entropy derivatives (strictly along dome) ──────────────────
     ds_l_dP, ds_v_dP = _sat_entropy_derivatives(P, fluid, dP)
 
-    # ── Mechanical compressibility ─────────────────────────────────────────────
-    mech = (alpha_l / (rho_l * c_l ** 2)
-            + alpha_v / (rho_v * c_v ** 2))
-
-    # ── Thermal relaxation ─────────────────────────────────────────────────────
+    mech  = alpha_l / (rho_l * c_l ** 2) + alpha_v / (rho_v * c_v ** 2)
     therm = T_sat * (
         alpha_l * rho_l * ds_l_dP ** 2 / Cp_l
         + alpha_v * rho_v * ds_v_dP ** 2 / Cp_v
     )
 
-    rho_c2_inv = mech + therm     # = 1 / (rho_mix * c_eq^2)
-
-    # ── Positive-definite check ────────────────────────────────────────────────
+    rho_c2_inv = mech + therm
     if rho_c2_inv <= 0.0 or not np.isfinite(rho_c2_inv):
         return None
 
     c_hem = float(np.sqrt(1.0 / (rho_mix * rho_c2_inv)))
-
     if not np.isfinite(c_hem) or c_hem <= 0.0:
         return None
 
@@ -237,6 +203,24 @@ def _phase_fractions(
             float(np.clip(x_v,     0.0, 1.0)))
 
 
+def _sat_props_at_P(P: float, fluid: str) -> tuple[float, float, float]:
+    """
+    Return (Hlsat, Hvsat, Rhov) at pressure P.
+
+    Returns (0.0, 0.0, 0.0) for supercritical pressures where Q-based
+    CoolProp queries are undefined.
+    """
+    if P >= P_CRIT_CO2 - 1e3:   # 1 kPa margin below critical
+        return 0.0, 0.0, 0.0
+    try:
+        hl   = float(CP.PropsSI("H", "P", P, "Q", 0, fluid))
+        hv   = float(CP.PropsSI("H", "P", P, "Q", 1, fluid))
+        rhov = float(CP.PropsSI("D", "P", P, "Q", 1, fluid))
+        return hl, hv, rhov
+    except Exception:
+        return 0.0, 0.0, 0.0
+
+
 # ================================================================================
 # 4.  EQUILIBRIUM ISENTROPE TABLE  (main entry point)
 # ================================================================================
@@ -245,40 +229,67 @@ def generate_equilibrium_table(
     P_in:     float,
     T_in:     float,
     fluid:    str,
+    P_max:    float | None = None,   # upper bound for grid; defaults to P_in
     P_min:    float = P_TRIPLE_CO2,
     label:    str   = "fluid",
     dP_deriv: float = 10.0,
-) -> pd.DataFrame:
+) -> tuple[pd.DataFrame, float]:
     """
     Generate a barotropic property table along the equilibrium isentrope
     anchored at (P_in, T_in).
 
-    Speed of Sound routing
-    ----------------------
-    two-phase  AND  |P - P_crit| > _P_CRIT_GUARD
-        => HEM fully-relaxed formula (_hem_sos_two_phase)
-    two-phase  AND  |P - P_crit| <= _P_CRIT_GUARD  (critical-point guard)
-        => CoolProp PropsSI('A') as fallback  [labelled 'CoolProp_guard']
-    _hem_sos_two_phase returns None (numerical failure)
-        => CoolProp PropsSI('A') as fallback  [labelled 'CoolProp_fallback']
-    single-phase (liquid, vapour, supercritical)
-        => CoolProp PropsSI('A') directly     [labelled 'CoolProp_single']
+    Parameters
+    ----------
+    P_in   : Inlet stagnation pressure [Pa]  — fixes the isentrope entropy
+    T_in   : Inlet stagnation temperature [K]
+    fluid  : CoolProp fluid string e.g. 'HEOS::CO2'
+    P_max  : Upper bound for the pressure grid [Pa].
+             Defaults to P_in.  Set to P_mot_in for the suction stream to
+             extend the table into the compression region of the mixing section.
+    P_min  : Lower bound (default: CO2 triple point)
+    label  : Console tag ('Motive' / 'Suction')
+    dP_deriv: Central-difference step for ds/dP [Pa]
+
+    Returns
+    -------
+    (df, h0)
+      df : pd.DataFrame  property table (see columns below)
+      h0 : float         inlet stagnation enthalpy [J kg^-1] = h(P_in, T_in)
 
     Output columns
     --------------
     Pressure, Rho, Mu,
-    SoS            -- value sent to CFX interpolation table
-    SoS_CoolProp   -- raw CoolProp value, kept for verification / plotting
-    SoS_source     -- 'HEM' | 'CoolProp_guard' | 'CoolProp_fallback' | 'CoolProp_single'
-    AlphaV, X_v, X_l_sat, X_l_meta, Phase
+    SoS           -- HEM or CoolProp speed of sound exported to CFX
+    SoS_CoolProp  -- CoolProp reference (audit only, not exported to CFX)
+    SoS_source    -- 'HEM' | 'CoolProp_guard' | 'CoolProp_fallback' | 'CoolProp_single'
+    AlphaV, X_v, X_l_sat, X_l_meta, Phase,
+    Hlsat         -- saturated liquid enthalpy h_l(P)  [J kg^-1]  (0 if supercritical)
+    Hvsat         -- saturated vapour enthalpy h_v(P)  [J kg^-1]  (0 if supercritical)
+    Rhov          -- saturated vapour density  rho_v(P)[kg m^-3]  (0 if supercritical)
+
+    Speed of Sound routing
+    ----------------------
+    two-phase AND |P - P_crit| > _P_CRIT_GUARD
+        => HEM fully-relaxed formula
+    two-phase AND |P - P_crit| <= _P_CRIT_GUARD  (critical-point guard)
+        => CoolProp PropsSI fallback  [labelled 'CoolProp_guard']
+    HEM returns None (numerical failure)
+        => CoolProp PropsSI fallback  [labelled 'CoolProp_fallback']
+    single-phase (liquid, vapour, supercritical)
+        => CoolProp PropsSI directly  [labelled 'CoolProp_single']
     """
+    if P_max is None:
+        P_max = P_in
+
     s_in = float(CP.PropsSI("S", "P", P_in, "T", T_in, fluid))
+    h0   = float(CP.PropsSI("H", "P", P_in, "T", T_in, fluid))
 
     print(f"\n{Fore.CYAN}[EqTable:{label}]{Style.RESET_ALL} "
           f"P_in = {P_in/1e5:.3f} bar | T_in = {T_in - 273.15:.2f} C | "
-          f"s_in = {s_in:.4f} J/kg/K")
+          f"s_in = {s_in:.4f} J/kg/K | h0 = {h0/1e3:.3f} kJ/kg | "
+          f"grid P_max = {P_max/1e5:.3f} bar")
 
-    P_grid   = make_pressure_grid(P_max=P_in, P_min=P_min)
+    P_grid   = make_pressure_grid(P_max=P_max, P_min=P_min)
     records  = []
     n_fail   = 0
     n_hem    = 0
@@ -287,20 +298,19 @@ def generate_equilibrium_table(
 
     for P in P_grid:
         try:
-            rho    = float(CP.PropsSI("D", "P", P, "S", s_in, fluid))
-            T_loc  = float(CP.PropsSI("T", "P", P, "S", s_in, fluid))
-            mu     = float(CP.PropsSI("V", "P", P, "S", s_in, fluid))
-            sos_cp = float(CP.PropsSI("d(P)/d(D)|S", "P", P, "S", s_in, fluid))**0.5
+            rho    = float(CP.PropsSI("D",           "P", P, "S", s_in, fluid))
+            T_loc  = float(CP.PropsSI("T",           "P", P, "S", s_in, fluid))
+            mu     = float(CP.PropsSI("V",           "P", P, "S", s_in, fluid))
+            sos_cp = float(CP.PropsSI("d(P)/d(D)|S", "P", P, "S", s_in, fluid)) ** 0.5
 
             phase_key = CP.PhaseSI("P", P, "S", s_in, fluid)
             is_two    = "two" in phase_key.lower()
 
             alpha_v, x_v = _phase_fractions(P, s_in, rho, fluid)
+            near_crit    = abs(P - P_CRIT_CO2) <= _P_CRIT_GUARD
 
-            near_crit = abs(P - P_CRIT_CO2) <= _P_CRIT_GUARD
-
+            # ── Speed of sound routing ─────────────────────────────────────────
             if is_two and not near_crit:
-                # HEM path
                 c_hem = None
                 try:
                     c_hem = _hem_sos_two_phase(
@@ -320,15 +330,16 @@ def generate_equilibrium_table(
                     n_fallbk += 1
 
             elif is_two and near_crit:
-                # Critical-point guard: bypass HEM
                 sos    = sos_cp
                 source = "CoolProp_guard"
                 n_guard += 1
 
             else:
-                # Single-phase: formula collapses to standard SoS
                 sos    = sos_cp
                 source = "CoolProp_single"
+
+            # ── Saturation building blocks (0 if outside dome) ────────────────
+            hl_sat, hv_sat, rhov_sat = _sat_props_at_P(P, fluid)
 
             records.append({
                 "Pressure":     P,
@@ -342,6 +353,10 @@ def generate_equilibrium_table(
                 "X_l_sat":      1.0 - x_v,
                 "X_l_meta":     0.0,
                 "Phase":        phase_key,
+                # Saturation building blocks — path-independent
+                "Hlsat":        hl_sat,
+                "Hvsat":        hv_sat,
+                "Rhov":         rhov_sat,
             })
 
         except Exception:
@@ -367,11 +382,68 @@ def generate_equilibrium_table(
         f"  SoS: HEM={n_hem}  crit-guard={n_guard}  "
         f"HEM-fallback={n_fallbk}  single-phase={len(df)-n_2ph}"
     )
+    return df, h0
+
+
+# ================================================================================
+# 5.  SATURATION TABLE  (dedicated dome-property table for CCL functions)
+# ================================================================================
+
+def generate_saturation_table(
+    P_max:  float,
+    fluid:  str,
+    P_min:  float = P_TRIPLE_CO2,
+    label:  str   = "sat",
+) -> pd.DataFrame:
+    """
+    Build a table of saturation-boundary properties on a dedicated pressure grid.
+
+    These are path-independent dome properties used for the CCL interpolation
+    functions fnHlsat(P), fnHvsat(P), fnRhov(P) in the enthalpy AV chain.
+
+    The grid is capped at P_crit - 1 kPa because Q-based CoolProp queries
+    are undefined above the critical point.  The CCL Extend Max = On flag
+    handles pressures that exceed the table range during solver iterations.
+
+    Output columns (alphanumeric — CEL compliant)
+    ---------------------------------------------
+    Pressure   [Pa]
+    Hlsat      [J kg^-1]   h_l(P)
+    Hvsat      [J kg^-1]   h_v(P)
+    Rhov       [kg m^-3]   rho_v(P)
+    """
+    P_max_sat = min(P_max, P_CRIT_CO2 - 1e3)   # cap 1 kPa below critical
+
+    print(f"\n{Fore.CYAN}[SatTable:{label}]{Style.RESET_ALL} "
+          f"P range = [{P_min/1e5:.2f}, {P_max_sat/1e5:.2f}] bar")
+
+    P_grid  = make_pressure_grid(P_max=P_max_sat, P_min=P_min)
+    records = []
+    n_fail  = 0
+
+    for P in P_grid:
+        hl, hv, rhov = _sat_props_at_P(P, fluid)
+        if rhov == 0.0:
+            n_fail += 1
+            continue
+        records.append({"Pressure": P, "Hlsat": hl, "Hvsat": hv, "Rhov": rhov})
+
+    if n_fail:
+        print(f"  {Fore.YELLOW}[Warning] {n_fail} points skipped "
+              f"(above critical or CoolProp error){Style.RESET_ALL}")
+
+    df = (pd.DataFrame(records)
+            .sort_values("Pressure")
+            .reset_index(drop=True))
+
+    print(f"  {Fore.GREEN}[OK] {len(df)} sat points  "
+          f"[{df['Pressure'].min()/1e5:.2f} - {df['Pressure'].max()/1e5:.2f} bar]"
+          f"{Style.RESET_ALL}")
     return df
 
 
 # ================================================================================
-# 5.  VERIFICATION PLOT
+# 6.  VERIFICATION PLOT
 # ================================================================================
 
 def plot_sos_comparison(
@@ -389,9 +461,6 @@ def plot_sos_comparison(
     [0,1]  Relative deviation (SoS_HEM - SoS_CP) / SoS_CP [%] — two-phase only
     [1,0]  AlphaV and X_v vs P — two-phase region reference
     [1,1]  Rho vs P — density sanity check
-
-    Vertical dashed lines mark saturation dome entry/exit.
-    Red dotted line marks P_crit.
     """
     fig, axes = plt.subplots(2, 2, figsize=figsize)
     fig.patch.set_facecolor("#ffffff")
@@ -423,10 +492,9 @@ def plot_sos_comparison(
             ax.axvline(P_dome_lo, color="#aaaaaa", ls="--", lw=0.8)
         if P_dome_hi is not None:
             ax.axvline(P_dome_hi, color="#aaaaaa", ls="--", lw=0.8)
-        ax.axvline(P_CRIT_CO2 / 1e5, color=C_GARD,
-                   ls=":", lw=0.9, label="$P_{crit}$")
+        ax.axvline(P_CRIT_CO2 / 1e5, color=C_GARD, ls=":", lw=0.9,
+                   label="$P_{crit}$")
 
-    # ── Panel [0,0]: SoS curves ──────────────────────────────────────────────
     ax = axes[0, 0]
     ax.set_facecolor("#ffffff")
     ax.plot(P_bar, df["SoS_CoolProp"],
@@ -450,7 +518,6 @@ def plot_sos_comparison(
     ax.legend(fontsize=8)
     ax.grid(True, alpha=0.25)
 
-    # ── Panel [0,1]: Relative deviation ──────────────────────────────────────
     ax = axes[0, 1]
     ax.set_facecolor("#ffffff")
     hem_df = df[is_hem].copy()
@@ -460,7 +527,6 @@ def plot_sos_comparison(
         ax.plot(hem_df["Pressure"] / 1e5, rel, color=C_HEM, lw=1.8)
         ax.axhline(0, color="k", lw=0.7, ls="--")
         _dome_lines(ax)
-
         idx_max = rel.abs().idxmax()
         ax.annotate(
             f"{rel[idx_max]:.1f}%\n@ {hem_df.loc[idx_max,'Pressure']/1e5:.1f} bar",
@@ -476,7 +542,6 @@ def plot_sos_comparison(
     ax.set_title("Relative Deviation (two-phase HEM only)")
     ax.grid(True, alpha=0.25)
 
-    # ── Panel [1,0]: Phase fractions ──────────────────────────────────────────
     ax = axes[1, 0]
     ax.set_facecolor("#ffffff")
     ax.plot(P_bar, df["AlphaV"], color="#e377c2", lw=1.8, label="alpha_v (vol.)")
@@ -489,7 +554,6 @@ def plot_sos_comparison(
     ax.legend(fontsize=8)
     ax.grid(True, alpha=0.25)
 
-    # ── Panel [1,1]: Density ──────────────────────────────────────────────────
     ax = axes[1, 1]
     ax.set_facecolor("#ffffff")
     ax.plot(P_bar, df["Rho"], color="#7f7f7f", lw=1.8)
@@ -507,16 +571,17 @@ def plot_sos_comparison(
 
 
 # ================================================================================
-# 6.  QUICK SANITY PRINT
+# 7.  QUICK SANITY PRINT
 # ================================================================================
 
 def print_table_summary(df: pd.DataFrame, label: str = "") -> None:
     """Print a thinned-row summary of key table quantities."""
     tag = f"[{label}] " if label else ""
     print(f"\n{Fore.MAGENTA}{tag}Table Summary{Style.RESET_ALL}")
-    cols      = ["Pressure", "Rho", "Mu", "SoS", "SoS_CoolProp", "AlphaV", "X_v"]
+    cols      = ["Pressure", "Rho", "Mu", "SoS", "SoS_CoolProp", "AlphaV", "X_v",
+                 "Hlsat", "Hvsat", "Rhov"]
     available = [c for c in cols if c in df.columns]
     subset    = df.iloc[:: max(1, len(df) // 8)][available]
     with pd.option_context("display.float_format", "{:.4e}".format,
-                           "display.width", 140):
+                           "display.width", 160):
         print(subset.to_string(index=False))
