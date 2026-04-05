@@ -1,11 +1,11 @@
 
-# CO2-Ejector-BaroTFM: High-Fidelity Two-Fluid Pipeline
+# Ejector-BaroTFM: High-Fidelity Two-Fluid Pipeline
 
-A specialized Python-to-Ansys CFX pipeline designed for simulating **Two-Phase Supersonic CO2 Ejectors**. This framework implements a physically rigorous **Barotropic Two-Fluid Model (TFM)** that treats motive and suction streams as distinct continuous phases, using mass-weighted enthalpy conservation to resolve the mixing zone.
+A Python-to-Ansys CFX pipeline designed for simulating **Two-Phase Supersonic CO2 Ejectors**. This framework implements a **Barotropic Two-Fluid Model (TFM)** that treats motive and suction streams as distinct continuous phases, using mass-weighted enthalpy conservation to resolve the mixing zone.
 
 ## 🚀 Key Technical Features
 
-* **Solver-Level Enthalpy Reconstruction**: Implements a 5-step Algebraic Additional Variable (AV) chain (`RhoMix` $\rightarrow$ `Ymot` $\rightarrow$ `Hmix` $\rightarrow$ `Xmix` $\rightarrow$ `VfVapMix`) to reconstruct the mixture thermodynamic state from conserved stagnation enthalpies.
+* **Solver-Level Enthalpy Reconstruction**: Implements a _5-step Algebraic Additional Variable_ (AV) chain (`RhoMix` $\rightarrow$ `Ymot` $\rightarrow$ `Hmix` $\rightarrow$ `Xmix` $\rightarrow$ `VfVapMix`) to reconstruct the mixture thermodynamic state from conserved stagnation enthalpies.
 * **Iteration-Based Pressure Ramping**: Utilizes a dynamic, parameterized CEL function linked to the CFX variable `aitern` (accumulated iteration number). This gradually transitions the suction inlet from discharge pressure to the target vacuum, ensuring numerical stability.
 * **HEM Speed of Sound**: Features a fully-relaxed Homogeneous Equilibrium Model (HEM) formulation, including thermal relaxation terms derived from saturation entropy derivatives ($ds/dp$).
 * **Extended Suction Table Range**: Property tables for the suction fluid are automatically extended to the motive inlet pressure ($P_{mot,in}$). This ensures property validity during compression waves and expansion fans within the mixing section.
@@ -19,7 +19,7 @@ While individual fluids expand along isentropic paths, the mixing process is gov
 $$h_{mix} = (Y_{mot} h_{0,mot} + Y_{suc} h_{0,suc}) - \frac{1}{2} |\mathbf{U}|^2$$
 
 ### 2. Fully-Relaxed Acoustics (HEM)
-The equilibrium speed of sound $c_{eq}$ captures the drastic change in compressibility within the two-phase region:
+The equilibrium speed of sound $c_{eq}$ captures the change in compressibility within the two-phase region:
 
 $$\frac{1}{\rho c_{eq}^2} = \frac{\alpha_l}{\rho_l c_l^2} + \frac{\alpha_v}{\rho_v c_v^2} + T \left[ \frac{\alpha_l \rho_l}{C_{p,l}} \left( \frac{ds_l}{dp} \right)^2 + \frac{\alpha_v \rho_v}{C_{p,v}} \left( \frac{ds_v}{dp} \right)^2 \right]$$
 

@@ -203,22 +203,36 @@ def _phase_fractions(
             float(np.clip(x_v,     0.0, 1.0)))
 
 
-def _sat_props_at_P(P: float, fluid: str) -> tuple[float, float, float]:
+def _sat_props_at_P(P: float, fluid: str) -> tuple[float, ...]:
     """
-    Return (Hlsat, Hvsat, Rhov) at pressure P.
+    Return (Hlsat, Hvsat, Rhov, Tsat, Rhol, Cl, Cv, Cpl, Cpv, dSldP, dSvdP) at pressure P.
 
-    Returns (0.0, 0.0, 0.0) for supercritical pressures where Q-based
+    Returns tuple of zeros for supercritical pressures where Q-based
     CoolProp queries are undefined.
     """
     if P >= P_CRIT_CO2 - 1e3:   # 1 kPa margin below critical
-        return 0.0, 0.0, 0.0
+        return tuple([0.0] * 11)
     try:
         hl   = float(CP.PropsSI("H", "P", P, "Q", 0, fluid))
         hv   = float(CP.PropsSI("H", "P", P, "Q", 1, fluid))
         rhov = float(CP.PropsSI("D", "P", P, "Q", 1, fluid))
-        return hl, hv, rhov
+        rhol = float(CP.PropsSI("D", "P", P, "Q", 0, fluid))
+        tsat = float(CP.PropsSI("T", "P", P, "Q", 0, fluid))
+
+        # Pure phase speeds of sound
+        cl   = float(CP.PropsSI("d(P)/d(D)|S", "P", P, "Q", 0, fluid)) ** 0.5
+        cv   = float(CP.PropsSI("d(P)/d(D)|S", "P", P, "Q", 1, fluid)) ** 0.5
+
+        # Specific heat capacities
+        cpl  = float(CP.PropsSI("C", "P", P, "Q", 0, fluid))
+        cpv  = float(CP.PropsSI("C", "P", P, "Q", 1, fluid))
+
+        # Thermal relaxation derivatives (ds/dP along saturation curve)
+        dsl_dP, dsv_dP = _sat_entropy_derivatives(P, fluid, dP=10.0)
+
+        return hl, hv, rhov, tsat, rhol, cl, cv, cpl, cpv, dsl_dP, dsv_dP
     except Exception:
-        return 0.0, 0.0, 0.0
+        return tuple([0.0] * 11)
 
 
 # ================================================================================
@@ -339,7 +353,9 @@ def generate_equilibrium_table(
                 source = "CoolProp_single"
 
             # ── Saturation building blocks (0 if outside dome) ────────────────
-            hl_sat, hv_sat, rhov_sat = _sat_props_at_P(P, fluid)
+            sat_props = _sat_props_at_P(P, fluid)
+            (hl_sat, hv_sat, rhov_sat, tsat, rhol_sat,
+             cl_sat, cv_sat, cpl_sat, cpv_sat, dsl_dP, dsv_dP) = sat_props
 
             records.append({
                 "Pressure":     P,
@@ -357,6 +373,14 @@ def generate_equilibrium_table(
                 "Hlsat":        hl_sat,
                 "Hvsat":        hv_sat,
                 "Rhov":         rhov_sat,
+                "Tsat":         tsat,
+                "Rhol":         rhol_sat,
+                "Cl":           cl_sat,
+                "Cv":           cv_sat,
+                "Cpl":          cpl_sat,
+                "Cpv":          cpv_sat,
+                "dSldP":        dsl_dP,
+                "dSvdP":        dsv_dP,
             })
 
         except Exception:
@@ -399,7 +423,7 @@ def generate_saturation_table(
     Build a table of saturation-boundary properties on a dedicated pressure grid.
 
     These are path-independent dome properties used for the CCL interpolation
-    functions fnHlsat(P), fnHvsat(P), fnRhov(P) in the enthalpy AV chain.
+    functions in the VCM architecture.
 
     The grid is capped at P_crit - 1 kPa because Q-based CoolProp queries
     are undefined above the critical point.  The CCL Extend Max = On flag
@@ -408,9 +432,17 @@ def generate_saturation_table(
     Output columns (alphanumeric — CEL compliant)
     ---------------------------------------------
     Pressure   [Pa]
+    Tsat       [K]         T_sat(P)
     Hlsat      [J kg^-1]   h_l(P)
     Hvsat      [J kg^-1]   h_v(P)
+    Rhol       [kg m^-3]   rho_l(P)
     Rhov       [kg m^-3]   rho_v(P)
+    Cl         [m s^-1]    c_l(P)
+    Cv         [m s^-1]    c_v(P)
+    Cpl        [J kg^-1 K^-1] Cp_l(P)
+    Cpv        [J kg^-1 K^-1] Cp_v(P)
+    dSldP      [J kg^-1 K^-1 Pa^-1] ds_l/dP
+    dSvdP      [J kg^-1 K^-1 Pa^-1] ds_v/dP
     """
     P_max_sat = min(P_max, P_CRIT_CO2 - 1e3)   # cap 1 kPa below critical
 
@@ -422,11 +454,25 @@ def generate_saturation_table(
     n_fail  = 0
 
     for P in P_grid:
-        hl, hv, rhov = _sat_props_at_P(P, fluid)
+        sat_props = _sat_props_at_P(P, fluid)
+        (hl, hv, rhov, tsat, rhol, cl, cv, cpl, cpv, dsl_dP, dsv_dP) = sat_props
         if rhov == 0.0:
             n_fail += 1
             continue
-        records.append({"Pressure": P, "Hlsat": hl, "Hvsat": hv, "Rhov": rhov})
+        records.append({
+            "Pressure": P,
+            "Tsat": tsat,
+            "Hlsat": hl,
+            "Hvsat": hv,
+            "Rhol": rhol,
+            "Rhov": rhov,
+            "Cl": cl,
+            "Cv": cv,
+            "Cpl": cpl,
+            "Cpv": cpv,
+            "dSldP": dsl_dP,
+            "dSvdP": dsv_dP,
+        })
 
     if n_fail:
         print(f"  {Fore.YELLOW}[Warning] {n_fail} points skipped "

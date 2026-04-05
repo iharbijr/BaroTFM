@@ -1,15 +1,15 @@
 """
-Master_TwoFluid.py
-==================
-Driver for the Two-Fluid Barotropic CO2 ejector pipeline.
+BaroTFM.py
+==========
+Driver for the VCM Barotropic CO2 ejector pipeline.
 
 All mesh location strings and boundary names are set to match
-the values parsed from the working base_setup.def exactly.
+the latest geometry configuration.
 
 Operating point:
     Motive : 115.599 bar / 45.161 C  (Total Pressure inlet)
-    Suction:  37.472 bar              (Static Pressure inlet)
-    Outlet :  46.998 bar              (Opening boundary)
+    Suction:  37.472 bar              (Stagnation / Total Pressure inlet)
+    Outlet :  46.998 bar              (Static Pressure Outlet)
 """
 
 import os
@@ -40,36 +40,33 @@ sim_config = {
     # -- Outlet opening pressure -------------------------------------------------
     "P_out": 46.99754738e5,             # [Pa]
 
-    # -- CFX domain (must match base_setup.def exactly) -------------------------
-    "DOMAIN_NAME":     "Ejector",
-    "DOMAIN_LOCATION": "DIFF,EXIT,MC,MC_DIFF,MC_DIV,MN,MN_in,SN",
+    # -- CFX domain (latest geometry configuration) -----------------------------
+    "DOMAIN_NAME":      "Ejector",
+    "DOMAIN_LOCATIONS": "DIFF,EXIT,MC,MC_DIFF,MC_DIV,MN,MN_in,SN",
 
-    # -- Boundary names and mesh face tags (from working .def) ------------------
+    # -- Boundary names and mesh face tags (updated geometry) -------------------
     # Boundary NAMES  → must match .def string-for-string (spaces OK, not CEL)
     # Boundary LOCATIONS → mesh face tags from the .def Location = lines
     "MOT_BC_NAME":     "Inlet MN",
-    "MOT_BC_LOCATION": "Inlet_MN",
+    "MOT_BC_LOCATION": "inlet_mn",
 
     "SUC_BC_NAME":     "Inlet SN",
-    "SUC_BC_LOCATION": "Inlet_SN",
+    "SUC_BC_LOCATION": "inlet_sn",
 
     "OUT_BC_NAME":     "Outlet",
-    "OUT_BC_LOCATION": "Outlet",
+    "OUT_BC_LOCATION": "outlet",
 
     "WALL_BC_NAME": "Ejector Default",
-    "WALL_LOCATION": (
-        "F156.152,F171.37,F172.182,F183.37,F184.37,F185.54,F186.54,"
-        "F187.43,F188.43,F189.43,F19.18,F20.18,F21.18,F318.216,"
-        "F319.216,F320.216,F329.216,F330.216,F331.216,F332.216,"
-        "F333.216,F352.43,F353.43,F354.43,F36.43,F368.18,F373.148,"
-        "F374.148,F375.148,F376.148,F390.148,F391.148,F392.148,"
-        "F393.148,F409.18,F410.18,F46.54,F55.43,F83.148"
+    "WALL_LOCATIONS": (
+        "Primitive 2D AI,Primitive 2D AJ,Primitive 2D AK,Primitive 2D AL,"
+        "Primitive 2D AM,Primitive 2D AN,Primitive 2D AO,Primitive 2D AP,"
+        "walls zone2d diff,walls zone2d exit,walls zone2d mc_diff,walls zone2d mc_div"
     ),
 
     "SYMM1_NAME":     "Symm 1",
-    "SYMM1_LOCATION": "Sym_1",
+    "SYMM1_LOCATION": "periodic.1 A",
     "SYMM2_NAME":     "Symm 2",
-    "SYMM2_LOCATION": "Sym_2",
+    "SYMM2_LOCATION": "periodic.1 B",
 
     # -- Isothermal fluid temperature (from working .def) -----------------------
     "FLUID_TEMPERATURE": 330.0,         # [K]
@@ -106,19 +103,3 @@ sim_config = {
 # ================================================================================
 
 run_script = tfp.run_two_fluid_pipeline_in_folder(sim_config)
-
-# os.system(run_script)              # sequential local run
-# os.system(f"sbatch {run_script}")  # SLURM submission
-
-
-# ================================================================================
-# PARAMETRIC SWEEP  (uncomment to use)
-# ================================================================================
-#
-# for P_mot, T_mot in [(110e5, 316.15), (115.6e5, 318.31), (120e5, 320.5)]:
-#     for P_suc in [35e5, 37.5e5, 40e5]:
-#         cfg = sim_config.copy()
-#         cfg["P_mot_in"] = P_mot
-#         cfg["T_mot_in"] = T_mot
-#         cfg["P_suc_in"] = P_suc
-#         tfp.run_two_fluid_pipeline_in_folder(cfg)
