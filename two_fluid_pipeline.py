@@ -392,10 +392,12 @@ def write_two_fluid_ccl(
             f.write( "      Option = General Material\n")
             f.write( "      DYNAMIC VISCOSITY:\n")
             f.write( "        Option = Value\n")
-            f.write( "        Dynamic Viscosity = 1.0 [kg m^-1 s^-1]\n")
+            # --- FIX: Link to the 1D Viscosity Table ---
+            f.write(f"        Dynamic Viscosity = {phase}Mu(Absolute Pressure)\n")
             f.write( "      END\n")
             f.write( "      EQUATION OF STATE:\n")
-            f.write( "        Density = 1.0 [kg m^-3]\n")
+            # --- FIX: Link to the 1D Density Table ---
+            f.write(f"        Density = {phase}Rho(Absolute Pressure)\n")
             f.write(f"        Molar Mass = {_CO2_MOLAR_MASS} [kg kmol^-1]\n")
             f.write( "        Option = Value\n")
             f.write( "      END\n")
@@ -444,6 +446,14 @@ def write_two_fluid_ccl(
         f.write(f"      Pstart = {P_out/1e5:.6f} [bar]\n")
         f.write(f"      PsucinRamp = {ramp_cel}\n")
         f.write("    END\n")
+
+        # --- FIX: Write the Motive and Suction Barotropic Tables ---
+        f.write("\n    # -- Phase-Specific Isentrope Functions (Density, Viscosity) -----\n")
+        f.write("    # Source: generated equilibrium tables for Motive and Suction streams\n")
+        for phase, df_phase in _phases:
+            for suffix, (col, units) in _MAT_FUNC_CATALOGUE.items():
+                func_name = f"{phase}{suffix}"
+                _write_func(f, func_name, df_phase, col, units)
 
         # Saturation dome functions (path-independent, from dedicated df_sat)
         f.write("\n    # -- Saturation Functions (VCM Phase Topology & HEM) -----\n")
@@ -675,10 +685,10 @@ def write_two_fluid_ccl(
         f.write( "      END\n")
         f.write( "    END\n")   # FLUID MODELS
 
-        # EXPERT PARAMETERS inside DOMAIN
-        f.write( "\n    EXPERT PARAMETERS:\n")
-        f.write( "      solve energy = f\n")
-        f.write( "    END\n")
+        # # EXPERT PARAMETERS inside DOMAIN
+        # f.write( "\n    EXPERT PARAMETERS:\n")
+        # f.write( "      solve energy = f\n")
+        # f.write( "    END\n")
 
         f.write( "  END\n")   # DOMAIN
         f.write( "END\n\n")  # FLOW (domain)
